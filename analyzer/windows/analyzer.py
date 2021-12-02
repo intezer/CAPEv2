@@ -2,7 +2,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 # TODO
-#  https://github.com/cuckoosandbox/cuckoo/blob/ad5bf8939fb4b86d03c4d96014b174b8b56885e3/cuckoo/core/plugins.py#L29
+#  https://github.com/cuckoosandbox/cuckoo/blob/ad5bf8939fb4b86d03c4d96014b174b8b56885e3/cuckoo/core/plugins.py#L29
 
 from __future__ import absolute_import
 import os
@@ -520,8 +520,8 @@ class Analyzer:
             raise CuckooError('The package "{0}" start function raised an ' "error: {1}".format(package_name, e))
         except Exception as e:
             raise CuckooError(
-                'The package "{0}" start function encountered ' "an unhandled exception: " "{1}".format(package_name,
-                                                                                                        e))
+                'The package "{0}" start function encountered ' "an unhandled exception: " "{1}".format(package_name, e)
+            )
 
         # If the analysis package returned a list of process IDs, we add them
         # to the list of monitored processes and enable the process monitor.
@@ -1220,8 +1220,11 @@ class CommandPipeHandler(object):
                         INJECT_LIST.append(process_id)
                     # Open the process and inject the DLL.
                     proc = Process(
-                        options=self.analyzer.options, config=self.analyzer.config, pid=process_id, thread_id=thread_id,
-                        suspended=suspended
+                        options=self.analyzer.options,
+                        config=self.analyzer.config,
+                        pid=process_id,
+                        thread_id=thread_id,
+                        suspended=suspended,
                     )
                     filepath = proc.get_filepath()  # .encode('utf8', 'replace')
                     # if it's a URL analysis, provide the URL to all processes as
@@ -1292,8 +1295,9 @@ class CommandPipeHandler(object):
             # Syntax -> PATH|PID|Metadata
             file_path, pid, ppid, metadata = file_path.split(b"|")
             if os.path.exists(file_path):
-                self.analyzer.files.dump_file(file_path.decode("utf-8"), pids=[pid.decode("utf-8")],
-                                              ppids=[ppid.decode("utf-8")], metadata=metadata, category="procdump")
+                self.analyzer.files.dump_file(
+                    file_path.decode("utf-8"), pids=[pid.decode("utf-8")], metadata=metadata, category="procdump"
+                )
 
         else:
             if os.path.exists(file_path):

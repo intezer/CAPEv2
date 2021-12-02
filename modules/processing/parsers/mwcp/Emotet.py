@@ -21,6 +21,7 @@ import re
 from Crypto.Util import asn1
 from Crypto.PublicKey import RSA
 from itertools import cycle
+import base64
 
 rule_source = """
 rule Emotet
@@ -38,12 +39,20 @@ rule Emotet
         $snippetA = {85 C0 74 5? 8B ?8 04 89 78 28 89 38 89 70 2C EB 04 41 89 48 04 39 34 CD [4] 75 F3 FF 75 DC FF 75 F0 8B 55 F8 FF 75 10 8B 4D EC E8 [4] 83 C4 0C 85 C0 74 05}
         $snippetB = {EB 04 4? 89 [2] 39 [6] 75 F3}
         $snippetC = {EB 03 4? 89 1? 39 [6] 75 F4}
+        $snippetD = {8D 44 [2] 50 68 [4] FF 74 [2] FF 74 [2] 8B 54 [2] 8B 4C [2] E8 [4] 8B 54 [2] 83 C4 10 89 44 [2] 8B F8 03 44 [2] B9 [4] 89 44 [2] E9 [2] FF FF}
+        $snippetE = {FF 74 [2] 8D 54 [2] FF 74 [2] 68 [4] FF 74 [2] 8B 4C [2] E8 [4] 8B 54 [2] 83 C4 10 89 44 [2] 8B F8 03 44 [2] B9 [4] 89 44 [2] E9 [2] FF FF}
+        $snippetF = {FF 74 [2] 8D 44 [2] BA [4] FF 74 [2] 8B 4C [2] 50 E8 [4] 8B 54 [2] 8B D8 8B 84 [5] 83 C4 0C 03 C3 89 5C [2] 8B FB 89 44}
+        $snippetG = {FF 74 [2] 8B 54 [2] 8D 44 [2] 8B 4C [2] 50 E8 [4] 8B D0 83 C4 0C 8B 44 [2] 8B FA 03 C2 89 54 [2] 89 44}
         $comboA1 = {83 EC 28 56 FF 75 ?? BE}
         $comboA2 = {83 EC 38 56 57 BE}
         $comboA3 = {EB 04 40 89 4? ?? 83 3C C? 00 75 F6}
         $ref_rsa = {6A 00 6A 01 FF [4-9] C0 [5-11] E8 ?? ?? FF FF 8D 4? [1-2] B9 ?? ?? ?? 00 8D 5? [4-6] E8}
+        $ref_ecc1 = {8D 84 [5] 50 68 [4] FF B4 24 [4] FF B4 24 [4] 8B 94 24 [4] 8B 8C 24 [4] E8 [4] 89 84 24 [4] 8D 84 24 [4] 50 68 [4] FF B4 24 [4] FF B4 24 [4] 8B 54 24 40 8B 8C 24 [4] E8}
+        $ref_ecc2 = {FF B4 [3] 00 00 8D 94 [3] 00 00 FF B4 [3] 00 00 68 [4] FF 74 [2] 8B 8C [3] 00 00 E8 [4] FF B4 [3] 00 00 8D 94 [3] 00 00 89 84 [3] 00 00 FF B4 [3] 00 00 68 [4] FF 74 [2] 8B 8C [3] 00 00 E8}
+        $ref_ecc3 = {8D 84 [5] BA [4] FF B4 [5] 8B 4C [2] 50 E8 [4] 83 C4 0C 89 84 [5] 8D 84 [5] BA [4] FF B4 [5] FF B4 [5] 8B 8C [5] 50 E8 05 05 01 00}
+        $ref_ecc4 = {FF 74 [2] 8B 94 [5] 8D 84 [5] 8B 8C [5] 50 E8 [4] 83 C4 0C 89 84 [5] 8D 84 [5] 68 [4] FF B4 [5] 8B 54 [2] 8B 8C [5] 50 E8}
     condition:
-        uint16(0) == 0x5A4D and any of ($snippet*) or 2 of ($comboA*) or $ref_rsa
+        uint16(0) == 0x5A4D and any of ($snippet*) or 2 of ($comboA*) or $ref_rsa or any of ($ref_ecc*)
 }
 
 """
@@ -118,7 +127,10 @@ def extract_emotet_rsakey(pe):
             res_list = list(set(res_list))
             pub_key = res_list[0][0:106]
             seq = asn1.DerSequence()
-            seq.decode(pub_key)
+            try:
+                seq.decode(pub_key)
+            except:
+                return
             return RSA.construct((seq[0], seq[1]))
 
 class Emotet(Parser):
@@ -360,6 +372,53 @@ class Emotet(Parser):
                                     else:
                                         break
                                     c2_list_offset += 8
+                            else:
+                                refc2list = yara_scan(filebuf, "$snippetD")
+                                if refc2list:
+                                    delta = 6
+                                    c2list_va_offset = int(refc2list["$snippetD"])
+                                else:
+                                    refc2list = yara_scan(filebuf, "$snippetE")
+                                    if refc2list:
+                                        delta = 13
+                                        c2list_va_offset = int(refc2list["$snippetE"])
+                                    else:
+                                        refc2list = yara_scan(filebuf, "$snippetF")
+                                        if refc2list:
+                                            delta = 9
+                                            c2list_va_offset = int(refc2list["$snippetF"])
+                                        else:
+                                            refc2list = yara_scan(filebuf, "$snippetG")
+                                            if refc2list:
+                                                delta = -4
+                                                c2list_va_offset = int(refc2list["$snippetG"])
+                                if c2list_va_offset:
+                                    c2_list_va = struct.unpack("I", filebuf[c2list_va_offset+delta:c2list_va_offset+delta+4])[0]
+                                    c2_list_rva = c2_list_va - image_base
+                                    try:
+                                        c2_list_offset = pe.get_offset_from_rva(c2_list_rva)
+                                    except pefile.PEFormatError as err:
+                                        pass
+                                    key = filebuf[c2_list_offset:c2_list_offset+4]
+                                    size = struct.unpack("I", filebuf[c2_list_offset+4:c2_list_offset+8])[0] ^ struct.unpack("I", key)[0]
+                                    c2_list_offset += 8
+                                    c2_list = xor_data(filebuf[c2_list_offset:], key)
+                                    offset = 0
+                                    while offset < size:
+                                        try:
+                                            ip = struct.unpack(">I", c2_list[offset:offset+4])[0]
+                                        except:
+                                            break
+                                        if ip == struct.unpack(">I", key)[0]:
+                                            break
+                                        c2_address = socket.inet_ntoa(struct.pack("!L", ip))
+                                        port = str(struct.unpack(">H", c2_list[offset+4:offset+6])[0])
+                                        if c2_address and port:
+                                            self.reporter.add_metadata("address", c2_address + ":" + port)
+                                            c2found = True
+                                        else:
+                                            break
+                                        offset += 8
 
         if not c2found:
             return
@@ -399,3 +458,45 @@ class Emotet(Parser):
                 seq = asn1.DerSequence()
                 seq.decode(rsa_key)
                 self.reporter.add_metadata("other", {"RSA public key": RSA.construct((seq[0], seq[1])).exportKey()})
+            else:
+                ref_ecc = yara_scan(filebuf, "$ref_ecc1")
+                if ref_ecc:
+                    ref_ecc_offset = int(ref_ecc["$ref_ecc1"])
+                    delta1 = 9
+                    delta2 = 62
+                else:
+                    ref_ecc = yara_scan(filebuf, "$ref_ecc2")
+                    if ref_ecc:
+                        ref_ecc_offset = int(ref_ecc["$ref_ecc2"])
+                        delta1 = 22
+                        delta2 = 71
+                    else:
+                        ref_ecc = yara_scan(filebuf, "$ref_ecc3")
+                        if ref_ecc:
+                            ref_ecc_offset = int(ref_ecc["$ref_ecc3"])
+                            delta1 = 8
+                            delta2 = 47
+                        else:
+                            ref_ecc = yara_scan(filebuf, "$ref_ecc4")
+                            if ref_ecc:
+                                ref_ecc_offset = int(ref_ecc["$ref_ecc4"])
+                                delta1 = -4
+                                delta2 = 49
+                if ref_ecc_offset:
+                    ref_eck_rva = struct.unpack("I", filebuf[ref_ecc_offset+delta1:ref_ecc_offset+delta1+4])[0] - image_base
+                    ref_ecs_rva = struct.unpack("I", filebuf[ref_ecc_offset+delta2:ref_ecc_offset+delta2+4])[0] - image_base
+                    try:
+                        eck_offset = pe.get_offset_from_rva(ref_eck_rva)
+                        ecs_offset = pe.get_offset_from_rva(ref_ecs_rva)
+                    except:
+                        return
+                    key = filebuf[eck_offset:eck_offset+4]
+                    size = struct.unpack("I", filebuf[eck_offset+4:eck_offset+8])[0] ^ struct.unpack("I", key)[0]
+                    eck_offset += 8
+                    eck_key = base64.b64encode(xor_data(filebuf[eck_offset:eck_offset+size], key))
+                    self.reporter.add_metadata("other", {"ECC ECK1": eck_key})
+                    key = filebuf[ecs_offset:ecs_offset+4]
+                    size = struct.unpack("I", filebuf[ecs_offset+4:ecs_offset+8])[0] ^ struct.unpack("I", key)[0]
+                    ecs_offset += 8
+                    ecs_key = base64.b64encode(xor_data(filebuf[ecs_offset:ecs_offset+size], key))
+                    self.reporter.add_metadata("other", {"ECC ECS1": ecs_key})

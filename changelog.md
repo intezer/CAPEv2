@@ -1,3 +1,38 @@
+### [01-12-2021]
+* Monitor: Bcrypt hooks, disable yara scans in IE, silent rdtscp emulation, other misc tweaks
+
+### [23-11-2021]
+* Integrate [Kixtart-Detokenizer](https://github.com/jhumble/Kixtart-Detokenizer)
+* Simplify integration of another tools to unpack/extract files
+
+### [18-11-2021]
+* Add [RichHeader](https://github.com/RichHeaderResearch/RichPE) MD5
+* Improve Suricata family detection
+* Extract strings on demand feature
+
+### [08-11-2021]
+* Monitor: rdtscp emulation, optional exception & breakpoint logging
+
+### [04-11-2021]
+* Move Office hook options from packages to monitor
+* Monitor: Disable NtWaitForSingleObject hook for 32-bit Windows 8+ due to crashes
+
+### [03-11-2021]
+* Add MongoDB multifield index for all SHA256 fields.
+    * if you using any other fields for frequent lookup, add indexes for that on your side to speedup database
+
+### [01-11-2021]
+* Allow download reports as zip via API
+* Fix python analysis support in Windows
+
+### [22-10-2021]
+* POC: AntiRansomware:
+    * Can be enabled in `processing.conf` it will disable processing of files with extensions that are not in allowed list, see `modules/processing/antiransomware.py`
+    * Specially useful to disable them in CAPE.py that gather all the metadata, yara etc and can consume a lot of ram
+
+### [21-10-2021]
+* Monitor update: Monitor fix for scan crashes in e.g. Equation Editor/Cmd (thanks Will)
+
 ### [19-10-2021]
 * Monitor update: Monitor fix for NtSuspendThread hook issue (thanks Intezer)
 

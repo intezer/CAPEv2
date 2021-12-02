@@ -20,6 +20,7 @@ import inspect
 import threading
 import multiprocessing
 import operator
+from io import BytesIO
 from datetime import datetime
 from collections import defaultdict
 
@@ -39,16 +40,28 @@ except ImportError:
 
 try:
     import chardet
+
     HAVE_CHARDET = True
 except ImportError:
     HAVE_CHARDET = False
+
+try:
+    import pyzipper
+
+    HAVE_PYZIPPER = True
+except ImportError:
+    HAVE_PYZIPPER = False
+    print("Missed pyzipper dependency: pip3 install pyzipper -U")
+
 
 def arg_name_clscontext(arg_val):
     val = int(arg_val, 16)
     enumdict = utils_dicts.ClsContextDict()
     return simple_pretty_print_convert(val, enumdict)
 
+
 config = Config()
+web_cfg = Config("web")
 
 HAVE_TMPFS = False
 if hasattr(config, "tmpfs"):
@@ -67,6 +80,76 @@ referrer_url_re = re.compile(
     r"(?:/?|[/?]\S+)$",
     re.IGNORECASE,
 )
+
+# change to read from config
+zippwd = web_cfg.zipped_download.get("zip_pwd", b"infected")
+if not isinstance(zippwd, bytes):
+    zippwd = zippwd.encode("utf-8")
+
+
+texttypes = [
+    "ASCII",
+    "Windows Registry text",
+    "XML document text",
+    "Unicode text",
+]
+
+# this doesn't work for bytes
+# textchars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7F})
+# is_binary_file = lambda bytes: bool(bytes.translate(None, textchars))
+
+
+def is_text_file(file_info, destination_folder, buf, file_data=False):
+
+    # print(file_info, any([file_type in file_info.get("type", "") for file_type in texttypes]))
+    if any([file_type in file_info.get("type", "") for file_type in texttypes]):
+
+        extracted_path = os.path.join(
+            destination_folder,
+            file_info.get(
+                "sha256",
+            ),
+        )
+        if not os.path.exists(extracted_path):
+            return
+
+        if not file_data:
+            with open(extracted_path, "rb") as f:
+                file_data = f.read()
+
+        if len(file_data) > buf:
+            data = file_data[:buf] + b" <truncated>"
+            file_info.setdefault("data", data.decode())
+        else:
+            file_info.setdefault("data", file_data.decode("latin-1"))
+
+
+def create_zip(files, folder=False):
+    """Utility function to create zip archive with file(s)"""
+    if not HAVE_PYZIPPER:
+        return False
+
+    if folder:
+        files = [os.path.join(folder, file) for file in os.listdir(folder)]
+
+    if not isinstance(files, list):
+        files = [files]
+
+    mem_zip = BytesIO()
+    with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
+        zf.setpassword(zippwd)
+        for file in files:
+            if not os.path.exists(file):
+                log.error(f"File does't exist: {file}")
+                continue
+
+            parent_folder = os.path.dirname(file).split(os.sep)[-1]
+            path = os.path.join(parent_folder, os.path.basename(file))
+            zf.write(file, path)
+
+    mem_zip.seek(0)
+    return mem_zip
+
 
 def free_space_monitor(path=False, return_value=False, processing=False, analysis=False):
     """
@@ -193,7 +276,7 @@ def convert_char(c):
 
 
 def is_printable(s):
-    """ Test if a string is printable."""
+    """Test if a string is printable."""
     for c in s:
         if isinstance(c, int):
             c = chr(c)
@@ -216,7 +299,7 @@ def convert_filename_char(c):
 
 
 def is_sane_filename(s):
-    """ Test if a filename is sane."""
+    """Test if a filename is sane."""
     for c in s:
         if isinstance(c, int):
             c = chr(c)
@@ -264,6 +347,7 @@ def bytes2str(convert):
 
     return convert
 
+
 def wide2str(string: Tuple[str, bytes]):
     """wide string detection, for strings longer than 11 chars
 
@@ -276,7 +360,11 @@ def wide2str(string: Tuple[str, bytes]):
     if type(string) is bytes:
         null_byte = 0
 
-    if len(string) >= 11 and all([string[char] == null_byte for char in (1,3,5,7,9,11)]) and all([string[char] != null_byte for char in (0,2,4,6,8,10)]):
+    if (
+        len(string) >= 11
+        and all([string[char] == null_byte for char in (1, 3, 5, 7, 9, 11)])
+        and all([string[char] != null_byte for char in (0, 2, 4, 6, 8, 10)])
+    ):
         if type(string) is bytes:
             return string.decode("utf-16")
         else:
@@ -783,6 +871,7 @@ def to_unicode(s):
 
     return result
 
+
 def get_user_filename(options, customs):
     opt_filename = ""
     for block in (options, customs):
@@ -801,18 +890,22 @@ def get_user_filename(options, customs):
 
 
 def generate_fake_name():
-    out = "".join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for i in range(random.randint(5, 15)))
+    out = "".join(
+        random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for i in range(random.randint(5, 15))
+    )
     return out
+
 
 MAX_FILENAME_LEN = 24
 
+
 def truncate_filename(x):
     truncated = None
-    parts = x.rsplit('.',1)
+    parts = x.rsplit(".", 1)
     if len(parts) > 1:
         # filename has extension
-        extension  = parts[1]
-        name = parts[0][:(MAX_FILENAME_LEN-(len(extension)+1))]
+        extension = parts[1]
+        name = parts[0][: (MAX_FILENAME_LEN - (len(extension) + 1))]
         truncated = f"{name}.{extension}"
     elif len(parts) == 1:
         # no extension
@@ -820,6 +913,7 @@ def truncate_filename(x):
     else:
         return None
     return truncated
+
 
 def sanitize_filename(x):
     """Kind of awful but necessary sanitizing of filenames to
@@ -899,6 +993,7 @@ def get_options(optstring):
         return {}
 
     return dict((value.strip() for value in option.split("=", 1)) for option in optstring.split(",") if option and "=" in option)
+
 
 # get iface ip
 def get_ip_address(ifname):

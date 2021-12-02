@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 import os
+import shutil
 import logging
 import tempfile
 import hashlib
@@ -9,6 +10,7 @@ from collections.abc import Mapping, Iterable
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.utils import is_text_file
 
 try:
     import yara
@@ -26,6 +28,8 @@ repconf = Config("reporting")
 process_cfg = Config("processing")
 
 log = logging.getLogger(__name__)
+
+logging.getLogger("Kixtart-Detokenizer").setLevel(logging.CRITICAL)
 
 if repconf.mongodb.enabled:
     import pymongo
@@ -45,6 +49,13 @@ try:
 except ImportError:
     print("Missed pefile library. Install it with: pip3 install pefile")
     HAVE_PEFILE = False
+
+try:
+    from lib.cuckoo.common.integrations.Kixtart.detokenize import Kixtart
+
+    HAVE_KIXTART = True
+except ImportError:
+    HAVE_KIXTART = False
 
 
 def init_yara():
@@ -159,6 +170,7 @@ if process_cfg.malduck.enabled:
         from lib.cuckoo.common.load_extra_modules import malduck_load_decoders
         from malduck.extractor import ExtractorModules, ExtractManager
         from malduck.extractor.extractor import Extractor
+
         # from malduck.extractor.loaders import load_modules
         from malduck.yara import Yara
 
@@ -355,7 +367,7 @@ def static_config_parsers(yara_hit, file_data):
                     "malwareconfig parsing error with %s: %s, you should submit issue/fix to https://github.com/kevthehermit/RATDecoders/",
                     cape_name,
                     e,
-            )
+                )
 
         if cape_name in cape_config and cape_config[cape_name] == {}:
             return {}
@@ -390,13 +402,16 @@ def static_config_parsers(yara_hit, file_data):
 def static_config_lookup(file_path, sha256=False):
     if not sha256:
         sha256 = hashlib.sha256(open(file_path, "rb").read()).hexdigest()
-    cape_tasks = results_db.analysis.find_one(
+    document_dict = results_db.analysis.find_one(
         {"target.file.sha256": sha256}, {"CAPE.configs": 1, "info.id": 1, "_id": 0}, sort=[("_id", pymongo.DESCENDING)]
     )
-    if not cape_tasks:
+
+    if not document_dict:
         return
-    for task in cape_tasks.get("CAPE", {}).get("configs", []) or []:
-        return task["info"]
+
+    has_config = document_dict.get("CAPE", {}).get("configs", [])
+    if has_config:
+        return document_dict["info"]
 
 
 def static_extraction(path):
@@ -432,3 +447,100 @@ def cape_name_from_yara(details, pid, results):
             if name not in results["detections2pid"][str(pid)]:
                 results["detections2pid"][str(pid)].append(name)
             return name
+
+
+def _extracted_files_metadata(folder, destination_folder, data_dictionary, content=False, files=False):
+    """
+    args:
+        folder - where files extracted
+        destination_folder - where to move extracted files
+        files - file names
+    """
+    metadata = list()
+    if not files:
+        files = os.listdir(folder)
+    for file in files:
+        full_path = os.path.join(folder, file)
+        file_details = File(full_path).get_all()
+        if file_details:
+            file_details = file_details[0]
+
+        metadata.append(file_details)
+        dest_path = os.path.join(destination_folder, file_details["sha256"])
+        if not os.path.exists(dest_path):
+            shutil.move(full_path, dest_path)
+
+    return metadata
+
+
+def generic_file_extractors(file, destination_folder, filetype, data_dictionary):
+    """
+    file - path to binary
+    destination_folder - where to move extracted files
+    filetype - magic string
+    data_dictionary - where to add data
+
+    Run all extra extractors/unpackers/extra scripts here, each extractor should check file header/type/identification:
+        msi_extract
+        kixtart_extract
+    """
+
+    for funcname in (msi_extract, kixtart_extract):
+        funcname(file, destination_folder, filetype, data_dictionary)
+
+
+def msi_extract(file, destination_folder, filetype, data_dictionary, msiextract="/usr/bin/msiextract"):  # dropped_path
+    """Work on MSI Installers"""
+
+    if "MSI Installer" not in filetype:
+        return
+
+    if not os.path.exists(msiextract):
+        logging.error("Missed dependency: sudo apt install msitools")
+        return
+
+    metadata = list()
+
+    with tempfile.TemporaryDirectory(prefix="msidump_") as tempdir:
+        try:
+            files = subprocess.check_output([msiextract, file, "--directory", tempdir], universal_newlines=True)
+            if files:
+                files = list(filter(None, files.split("\n")))
+                metadata += _extracted_files_metadata(tempdir, destination_folder, data_dictionary, files=files)
+
+        except Exception as e:
+            logging.error(e, exc_info=True)
+
+    if metadata:
+        for meta in metadata:
+            is_text_file(meta, destination_folder, 8192)
+
+        data_dictionary.setdefault("msitools", metadata)
+
+
+def kixtart_extract(file, destination_folder, filetype, data_dictionary):
+    """
+    https://github.com/jhumble/Kixtart-Detokenizer/blob/main/detokenize.py
+    """
+
+    if not HAVE_KIXTART:
+        return
+
+    with open(file, "rb") as f:
+        content = f.read()
+
+    metadata = list()
+
+    if content.startswith(b"\x1a\xaf\x06\x00\x00\x10"):
+        with tempfile.TemporaryDirectory(prefix="kixtart_") as tempdir:
+            kix = Kixtart(file, dump_dir=tempdir)
+            kix.decrypt()
+            kix.dump()
+
+            metadata += _extracted_files_metadata(tempdir, destination_folder, data_dictionary, content=content)
+
+    if metadata:
+        for meta in metadata:
+            is_text_file(meta, destination_folder, 8192)
+
+        data_dictionary.setdefault("kixtart", metadata)
