@@ -1272,7 +1272,7 @@ class CommandPipeHandler(object):
 
     def _handle_file_cape(self, data):
         """Notification of a new dropped file."""
-        # Syntax -> PATH|PID|Metadata
+        # Syntax -> PATH|PID|PPID|Metadata
         file_path, pid, ppid, metadata = data.split(b"|")
         if os.path.exists(file_path):
             self.analyzer.files.dump_file(file_path.decode("utf-8"), pids=[pid.decode("utf-8")],
@@ -1292,12 +1292,11 @@ class CommandPipeHandler(object):
         # We extract the file path.
         # We dump immediately.
         if b"\\CAPE\\" in file_path:
-            # Syntax -> PATH|PID|Metadata
+            # Syntax -> PATH|PID|PPID|Metadata
             file_path, pid, ppid, metadata = file_path.split(b"|")
             if os.path.exists(file_path):
-                self.analyzer.files.dump_file(
-                    file_path.decode("utf-8"), pids=[pid.decode("utf-8")], metadata=metadata, category="procdump"
-                )
+                self.analyzer.files.dump_file(file_path.decode("utf-8"), pids=[pid.decode("utf-8")],
+                                              ppids=[ppid.decode("utf-8")], metadata=metadata, category="procdump")
 
         else:
             if os.path.exists(file_path):

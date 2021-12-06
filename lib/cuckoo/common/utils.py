@@ -12,6 +12,7 @@ import random
 import struct
 import fcntl
 import socket
+import zipfile
 import tempfile
 import xmlrpc.client
 import errno
@@ -110,7 +111,7 @@ def is_text_file(file_info, destination_folder, buf, file_data=False):
                 "sha256",
             ),
         )
-        if not os.path.exists(extracted_path):
+        if not file_data and not os.path.exists(extracted_path):
             return
 
         if not file_data:
@@ -124,20 +125,30 @@ def is_text_file(file_info, destination_folder, buf, file_data=False):
             file_info.setdefault("data", file_data.decode("latin-1"))
 
 
-def create_zip(files, folder=False):
-    """Utility function to create zip archive with file(s)"""
-    if not HAVE_PYZIPPER:
-        return False
+def create_zip(files=False, folder=False, encrypted=False):
+    """Utility function to create zip archive with file(s)
+    @param files: file or list of files
+    @param folder: path to folder to compress
+    @param encrypted: create password protected and AES encrypted file
+    """
 
     if folder:
-        files = [os.path.join(folder, file) for file in os.listdir(folder)]
+        # To avoid when we have only folder argument
+        if not files:
+            files = list()
+        files += [os.path.join(folder, file) for file in os.listdir(folder)]
 
     if not isinstance(files, list):
         files = [files]
 
     mem_zip = BytesIO()
-    with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
-        zf.setpassword(zippwd)
+    if encrypted and HAVE_PYZIPPER:
+        zipper = pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES)
+    else:
+        zipper = zipfile.ZipFile(mem_zip, "a", zipfile.ZIP_DEFLATED, False)
+    with zipper as zf:
+        if encrypted:
+            zf.setpassword(zippwd)
         for file in files:
             if not os.path.exists(file):
                 log.error(f"File does't exist: {file}")
