@@ -10,13 +10,14 @@ import errno
 
 from ctypes import create_string_buffer, c_uint, byref, sizeof, addressof
 
-from lib.common.defines import KERNEL32, PIPE_ACCESS_INBOUND, ERROR_MORE_DATA
+from lib.common.defines import KERNEL32, PIPE_ACCESS_INBOUND, ERROR_MORE_DATA, PVOID
 from lib.common.defines import PIPE_TYPE_BYTE, PIPE_WAIT, ERROR_PIPE_CONNECTED
 from lib.common.defines import PIPE_UNLIMITED_INSTANCES, INVALID_HANDLE_VALUE
-from lib.common.defines import FILE_FLAG_WRITE_THROUGH, PIPE_READMODE_BYTE
+from lib.common.defines import PIPE_READMODE_BYTE
 from lib.common.defines import ERROR_BROKEN_PIPE, PIPE_TYPE_MESSAGE
 from lib.common.defines import PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE
-from lib.common.defines import SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, ADVAPI32
+from lib.common.defines import SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, ADVAPI32, SDDL_REVISION_1
+
 log = logging.getLogger(__name__)
 
 BUFSIZE = 0x10000
@@ -150,26 +151,48 @@ class PipeDispatcher(threading.Thread):
 class PipeServer(threading.Thread):
     """Accept incoming pipe handlers and initialize them in a new thread."""
 
-    def __init__(self, pipe_handler, pipe_name, message=False, **kwargs):
+    def __init__(self, pipe_handler, pipe_name, message=False, custom_sddl=None, **kwargs):
         threading.Thread.__init__(self)
         self.pipe_handler = pipe_handler
         self.pipe_name = pipe_name
         self.message = message
+        self.custom_sddl = custom_sddl
         self.kwargs = kwargs
         self.do_run = True
         self.handlers = set()
 
+    def get_custom_security_descriptor(self):
+        if not self.custom_sddl:
+            return None
+
+        sd = PVOID(0)
+        result = ADVAPI32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                self.custom_sddl, SDDL_REVISION_1, addressof(sd), 0)
+        if result == 0:
+            err = KERNEL32.GetLastError()
+            log.warning("ConvertStringSecurityDescriptorToSecurityDescriptorW Failed. Err: %s", err)
+            return None
+
+        return sd
+
     def run(self):
         while self.do_run:
             # Create the Named Pipe.
-            sd = SECURITY_DESCRIPTOR()
+            if self.custom_sddl:
+                lp_security_descriptor = self.get_custom_security_descriptor()
+                if lp_security_descriptor is None:
+                    log.warning("Failed to create pipe server security attributes.")
+                    continue
+            else:
+                sd = SECURITY_DESCRIPTOR()
+                ADVAPI32.InitializeSecurityDescriptor(byref(sd), 1)
+                ADVAPI32.SetSecurityDescriptorDacl(byref(sd), True, None, False)
+                lp_security_descriptor = addressof(sd)
+
             sa = SECURITY_ATTRIBUTES()
-            ADVAPI32.InitializeSecurityDescriptor(byref(sd), 1)
-            ADVAPI32.SetSecurityDescriptorDacl(byref(sd), True, None, False)
             sa.nLength = sizeof(SECURITY_ATTRIBUTES)
             sa.bInheritHandle = False
-            sa.lpSecurityDescriptor = addressof(sd)
-            # flags = FILE_FLAG_WRITE_THROUGH
+            sa.lpSecurityDescriptor = lp_security_descriptor
 
             if self.message:
                 pipe_handle = KERNEL32.CreateNamedPipeW(

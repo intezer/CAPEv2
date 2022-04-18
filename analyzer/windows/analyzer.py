@@ -260,8 +260,10 @@ class Analyzer:
 
         # Initialize and start the Pipe Servers. This is going to be used for
         # communicating with the injected and monitored processes.
-
-        self.command_pipe = PipeServer(PipeDispatcher, self.config.pipe, message=True,
+        custom_sddl = self.options.get("custom_pipe_sddl")
+        if custom_sddl:
+            log.info("Using custom pipe sddl: %s", custom_sddl)
+        self.command_pipe = PipeServer(PipeDispatcher, self.config.pipe, message=True, custom_sddl=custom_sddl,
                                        dispatcher=CommandPipeHandler(self))
         self.command_pipe.daemon = True
         self.command_pipe.start()
@@ -270,7 +272,8 @@ class Analyzer:
         # open up a pipe that monitored processes will use to send logs to
         # before they head off to the host machine.
         destination = self.config.ip, self.config.port
-        self.log_pipe_server = PipeServer(PipeForwarder, self.config.logpipe, destination=destination)
+        self.log_pipe_server = PipeServer(PipeForwarder, self.config.logpipe, custom_sddl=custom_sddl,
+                                          destination=destination)
 
         # We update the target according to its category. If it's a file, then
         # we store the path.
