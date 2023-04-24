@@ -84,3 +84,4 @@ netstruct
 pymongo>=3.11.3
 django-ratelimit
 simplejson==3.16.0
+netifaces==0.10.4
