@@ -82,3 +82,4 @@ java-random
 pype32-py3
 pyvmomi
 httpreplay
+simplejson==3.16.0
