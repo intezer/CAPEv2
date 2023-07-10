@@ -2,12 +2,11 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import os
 import random
+
 from lib.cuckoo.common import utils_pretty_print_funcs as pp_fn
+from lib.cuckoo.common.path_utils import path_delete
 
 random.seed(1338)
 
@@ -90,18 +89,18 @@ def gen_rnd_data(func, lower, upper, arg_name=None):
     print_end()
 
 
-if not os.environ.get("GEN_DATA", None):
+if not os.environ.get("GEN_DATA"):
     import utils_pretty_print_funcs_data as data
 else:
     try:
-        os.unlink("CAPEv2/tests/utils_pretty_print_funcs_data.py")
+        path_delete("CAPEv2/tests/utils_pretty_print_funcs_data.py")
     except Exception as e:
         print(("Error in cleanup: " + str(e)))
     gen_data_file()
 
 
 def test_calls():
-    if not os.environ.get("GEN_DATA", None):
+    if not os.environ.get("GEN_DATA"):
         for val, ret in data.api_name_ntcreatesection_arg_name_desiredaccess_data():
             assert pp_fn.api_name_ntcreatesection_arg_name_desiredaccess(val) == ret
         for val, ret in data.api_name_shgetfolderpathw_arg_name_folder_data():

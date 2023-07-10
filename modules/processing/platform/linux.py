@@ -3,13 +3,15 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import datetime
-import dateutil.parser
-import os
 import logging
+import os
 import re
 from functools import reduce
 
+import dateutil.parser
+
 from lib.cuckoo.common.abstracts import BehaviorHandler
+from lib.cuckoo.common.path_utils import path_exists
 
 log = logging.getLogger(__name__)
 
@@ -50,11 +52,12 @@ class LinuxSystemTap(BehaviorHandler):
 
     def _check_for_probelkm(self):
         path_lkm = os.path.join(self.analysis.logs_path, "all.lkm")
-        if os.path.exists(path_lkm):
-            lines = open(path_lkm).readlines()
+        if path_exists(path_lkm):
+            with open(path_lkm) as f:
+                lines = f.readlines()
 
-            forks = [re.findall("task (\d+)@0x[0-9a-f]+ forked to (\d+)@0x[0-9a-f]+", line) for line in lines]
-            self.forkmap = dict((j, i) for i, j in reduce(lambda x, y: x + y, forks, []))
+            forks = [re.findall(r"task (\d+)@0x[0-9a-f]+ forked to (\d+)@0x[0-9a-f]+", line) for line in lines]
+            self.forkmap = {j: i for i, j in reduce(lambda x, y: x + y, forks, [])}
 
             # self.results["source"].append("probelkm")
 
@@ -112,18 +115,20 @@ class LinuxStrace(BehaviorHandler):
         self._check_for_straceds()
 
     def _check_for_straceds(self):
-        if os.path.exists(self.analysis.logs_path):
-            for path in os.listdir(self.analysis.logs_path):
-                if path.startswith("straced.") and path != "straced.error":
-                    current_pid = path.replace("straced.", "")
-                    path_straced = os.path.join(self.analysis.logs_path, path)
-                    if os.path.exists(path_straced):
-                        lines = open(path_straced).readlines()
-                        # get pid from filename and add fork one
-                        forks = [re.findall("fork\(\)\s+= (\d+)", line) for line in lines]
-                        if forks:
-                            # strace is multiple files not only one as systemtap
-                            self.forkmap.update(dict((i, current_pid) for i in reduce(lambda x, y: x + y, forks, [])))
+        if not path_exists(self.analysis.logs_path):
+            return
+        for path in os.listdir(self.analysis.logs_path):
+            if path.startswith("straced.") and path != "straced.error":
+                current_pid = path.replace("straced.", "")
+                path_straced = os.path.join(self.analysis.logs_path, path)
+                if path_exists(path_straced):
+                    with open(path_straced) as f:
+                        lines = f.readlines()
+                    # get pid from filename and add fork one
+                    forks = [re.findall(r"fork\(\)\s+= (\d+)", line) for line in lines]
+                    if forks:
+                        # strace is multiple files not only one as systemtap
+                        self.forkmap.update({i: current_pid for i in reduce(lambda x, y: x + y, forks, [])})
 
     def handles_path(self, path):
         path = os.path.basename(path)
@@ -164,7 +169,7 @@ class LinuxStrace(BehaviorHandler):
         return self.processes
 
 
-class StraceParser(object):
+class StraceParser:
     """Handle strace logs from the Linux analyzer."""
 
     def __init__(self, path):
@@ -173,9 +178,9 @@ class StraceParser(object):
 
     def __iter__(self):
         self.fd.seek(0)
-        pid = os.path.basename(self.path).split(".")[1]
+        pid = os.path.basename(self.path).split(".", 2)[1]
         for line in self.fd:
-            parts = re.match("^(\w+)\((.*)\)[ ]{1,}=? ([-]?\d)", line)
+            parts = re.match(r"^(\w+)\((.*)\)[ ]{1,}=? ([-]?\d)", line)
             if not parts:
                 # log.warning("Could not parse syscall trace line: %s", line.strip())
                 continue
@@ -183,23 +188,22 @@ class StraceParser(object):
             fn, arguments, retval = parts.groups()
             """
             if fn in SOCKET_SYSCALL_NAMES:
-                print "network", fn
+                print("network", fn)
             elif fn in SOCKET_SYSCALL_FILESYSTEM_NAMES:
-                print "filesystem", fn
+                print("filesystem", fn)
             elif fn in SOCKET_SYSCALL_PROCESS_NAMES:
-                print "process", fn
+                print("process", fn)
             """
 
             argsplit = arguments.split(", ")
-            tmp_argslist = list()
-            for pos in range(len(argsplit)):
-                if argsplit[pos].startswith("{"):
-                    argsplit[pos] = argsplit[pos][1:]
-                if argsplit[pos].endswith("}"):
-                    argsplit[pos] = argsplit[pos][:-1]
+            tmp_argslist = []
+            for pos, arg in enumerate(argsplit):
+                if arg.startswith("{"):
+                    argsplit[pos] = arg[1:]
+                if arg.endswith("}"):
+                    argsplit[pos] = arg[:-1]
                 tmp_argslist.append(argsplit[pos])
-            arguments = dict(("p%u" % pos, tmp_argslist[pos]) for pos in range(len(tmp_argslist)))
-            # print {"time": datetime.datetime.now(), "process_name": "", "pid": pid, "instruction_pointer": None, "api": fn, "arguments": arguments, "return_value": retval, "status": None, "type": "apicall", "raw": line}
+            arguments = {f"p{pos}": tmp_arg for pos, tmp_arg in enumerate(tmp_argslist)}
             yield {
                 "time": datetime.datetime.now(),
                 "process_name": "",
@@ -214,7 +218,7 @@ class StraceParser(object):
             }
 
 
-class StapParser(object):
+class StapParser:
     """Handle .stap logs from the Linux analyzer."""
 
     def __init__(self, fd):
@@ -275,8 +279,7 @@ class StapParser(object):
             return self.parse_array(argstr)
         elif self.is_string(argstr):
             return self.parse_string(argstr)
-        else:
-            return argstr
+        return argstr
 
     def parse_array(self, argstr):
         return [self.parse_arg(a) for a in argstr.lstrip("[").split(", ")]

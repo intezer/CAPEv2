@@ -2,11 +2,8 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import shutil
-
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
 
 
 class Unpacker(Package):
@@ -16,8 +13,10 @@ class Unpacker(Package):
     #    ("SystemRoot", "system32"),
     # ]
 
-    def __init__(self, options={}, config=None):
+    def __init__(self, options=None, config=None):
         """@param options: options dict."""
+        if options is None:
+            options = {}
         self.config = config
         self.options = options
         self.pids = []
@@ -32,9 +31,5 @@ class Unpacker(Package):
         # See CWinApp::SetCurrentHandles(), it will throw
         # an exception that will crash the app if it does
         # not find an extension on the main exe's filename
-        if "." not in os.path.basename(path):
-            new_path = path + ".exe"
-            os.rename(path, new_path)
-            path = new_path
-
+        path = check_file_extension(path, ".exe")
         return self.execute(path, arguments, path)

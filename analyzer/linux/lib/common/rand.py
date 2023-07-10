@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 import random
 import string
 
@@ -16,5 +15,5 @@ def random_string(minimum, maximum=None, charset=None):
 
 def random_integer(digits):
     start = 10 ** (digits - 1)
-    end = (10 ** digits) - 1
+    end = (10**digits) - 1
     return random.randint(start, end)

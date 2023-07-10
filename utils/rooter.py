@@ -3,26 +3,27 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import sys
-import signal
 import argparse
+import errno
 import grp
 import json
 import logging.handlers
-import os.path
+import os
+import signal
 import socket
 import stat
 import subprocess
 import sys
-import errno
 
+if sys.version_info[:2] < (3, 8):
+    sys.exit("You are running an incompatible version of Python, please use >= 3.8")
 
-if sys.version_info[:2] < (3, 5):
-    sys.exit("You are running an incompatible version of Python, please use >= 3.5")
+CUCKOO_ROOT = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..")
+sys.path.append(CUCKOO_ROOT)
 
+from lib.cuckoo.common.path_utils import path_delete, path_exists
 
+username = False
 log = logging.getLogger("cuckoo-rooter")
 formatter = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 ch = logging.StreamHandler()
@@ -31,7 +32,7 @@ log.addHandler(ch)
 log.setLevel(logging.INFO)
 
 
-class s(object):
+class s:
     iptables = None
     iptables_save = None
     iptables_restore = None
@@ -44,6 +45,18 @@ def run(*args):
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     stdout, stderr = p.communicate()
     return stdout, stderr
+
+
+def check_tuntap(vm_name, main_iface):
+    """Create tuntap device for qemu vms"""
+    try:
+        run([s.ip, "tuntap", "add", "dev", f"tap_{vm_name}", "mode", "tap", "user", username])
+        run([s.ip, "link", "set", "tap_{vm_name}", "master", main_iface])
+        run([s.ip, "link", "set", "dev", "tap_{vm_name}", "up"])
+        run([s.ip, "link", "set", "dev", main_iface, "up"])
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def run_iptables(*args):
@@ -66,10 +79,7 @@ def cleanup_rooter():
     if not stdout:
         return
 
-    cleaned = []
-    for l in stdout.split("\n"):
-        if l and "CAPE-rooter" not in l:
-            cleaned.append(l)
+    cleaned = [line for line in stdout.split("\n") if line and "CAPE-rooter" not in line]
 
     p = subprocess.Popen([s.iptables_restore], stdin=subprocess.PIPE, universal_newlines=True)
     p.communicate(input="\n".join(cleaned))
@@ -78,7 +88,9 @@ def cleanup_rooter():
 def nic_available(interface):
     """Check if specified network interface is available."""
     try:
-        subprocess.check_call([settings.ip, "link", "show", interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        subprocess.check_call(
+            [settings.ip, "link", "show", interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        )
         return True
     except subprocess.CalledProcessError:
         return False
@@ -88,7 +100,10 @@ def rt_available(rt_table):
     """Check if specified routing table is defined."""
     try:
         subprocess.check_call(
-            [settings.ip, "route", "list", "table", rt_table], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            [settings.ip, "route", "list", "table", rt_table],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
         )
         return True
     except subprocess.CalledProcessError:
@@ -104,6 +119,7 @@ def vpn_status(name):
             break
 
     return ret
+
 
 def forward_drop():
     """Disable any and all forwarding unless explicitly said so."""
@@ -136,7 +152,7 @@ def disable_nat(interface):
 def init_rttable(rt_table, interface):
     """Initialise routing table for this interface using routes
     from main table."""
-    if rt_table in ["local", "main", "default"]:
+    if rt_table in ("local", "main", "default"):
         return
 
     stdout, _ = run(settings.ip, "route", "list", "dev", interface)
@@ -148,7 +164,7 @@ def init_rttable(rt_table, interface):
 
 def flush_rttable(rt_table):
     """Flushes specified routing table entries."""
-    if rt_table in ["local", "main", "default"]:
+    if rt_table in ("local", "main", "default"):
         return
 
     run(settings.ip, "route", "flush", "table", rt_table)
@@ -171,6 +187,38 @@ def forward_disable(src, dst, ipaddr):
     another."""
     run_iptables("-D", "FORWARD", "-i", src, "-o", dst, "--source", ipaddr, "-j", "ACCEPT")
     run_iptables("-D", "FORWARD", "-i", dst, "-o", src, "--destination", ipaddr, "-j", "ACCEPT")
+
+
+def forward_reject_enable(src, dst, ipaddr, reject_segments):
+    """Enable forwarding a specific IP address from one interface into another
+    but reject some targets network segments."""
+    run_iptables("-I", "FORWARD", "-i", src, "-o", dst, "--source", ipaddr, "--destination", reject_segments, "-j", "REJECT")
+
+
+def forward_reject_disable(src, dst, ipaddr, reject_segments):
+    """Disable forwarding a specific IP address from one interface into another
+    but reject some targets network segments."""
+    run_iptables("-D", "FORWARD", "-i", src, "-o", dst, "--source", ipaddr, "--destination", reject_segments, "-j", "REJECT")
+
+
+def hostports_reject_enable(src, ipaddr, reject_hostports):
+    """Enable drop a specific IP address from one interface to host ports."""
+    run_iptables(
+        "-A", "INPUT", "-i", src, "--source", ipaddr, "-p", "tcp", "-m", "multiport", "--dport", reject_hostports, "-j", "REJECT"
+    )
+    run_iptables(
+        "-A", "INPUT", "-i", src, "--source", ipaddr, "-p", "udp", "-m", "multiport", "--dport", reject_hostports, "-j", "REJECT"
+    )
+
+
+def hostports_reject_disable(src, ipaddr, reject_hostports):
+    """Disable drop a specific IP address from one interface to host ports."""
+    run_iptables(
+        "-D", "INPUT", "-i", src, "--source", ipaddr, "-p", "tcp", "-m", "multiport", "--dport", reject_hostports, "-j", "REJECT"
+    )
+    run_iptables(
+        "-D", "INPUT", "-i", src, "--source", ipaddr, "-p", "udp", "-m", "multiport", "--dport", reject_hostports, "-j", "REJECT"
+    )
 
 
 def srcroute_enable(rt_table, ipaddr):
@@ -234,11 +282,31 @@ def inetsim_redirect_port(action, srcip, dstip, ports):
             log.debug("Invalid inetsim ports entry: %s", entry)
             continue
         srcport, dstport = entry.split(":")
-        if not srcport.isdigit() or not dstport.isdigit():
-            log.debug("Invalid inetsim ports entry: %s", entry)
+        if not dstport.isdigit():
+            log.debug("Invalid inetsim dstport entry: %s", dstport)
             continue
-        run(
-            settings.iptables,
+
+        # Handle srcport ranges
+        if "-" in srcport:
+            # We need a single hyphen to indicate that it is a range
+            if srcport.count("-") != 1:
+                log.debug("Invalid inetsim srcport range entry: %s", srcport)
+                continue
+            else:
+                start_srcport, end_srcport = srcport.split("-")
+                if not start_srcport.isdigit() or not end_srcport.isdigit():
+                    log.debug("Invalid inetsim srcport range entry: %s", srcport)
+                    continue
+                else:
+                    # Good to go! iptables takes port ranges as start:end
+                    srcport = srcport.replace("-", ":")
+
+        # Handle a single srcport
+        else:
+            if not srcport.isdigit():
+                log.debug("Invalid inetsim srcport entry: %s", srcport)
+                continue
+        run_iptables(
             "-t",
             "nat",
             action,
@@ -257,18 +325,63 @@ def inetsim_redirect_port(action, srcip, dstip, ports):
         )
 
 
-def inetsim_enable(ipaddr, inetsim_ip, dns_port, resultserver_port, ports):
-    """Enable hijacking of all traffic and send it to InetSIM."""
-    log.info("Enabling inetsim route.")
-    inetsim_redirect_port("-A", ipaddr, inetsim_ip, ports)
+def inetsim_service_port_trap(action, srcip, dstip, protocol):
+    # Note that the multiport limit for ports specified is 15,
+    # so we will split this up into two rules
     run_iptables(
         "-t",
         "nat",
-        "-I",
+        action,
+        "PREROUTING",
+        "--source",
+        srcip,
+        "-p",
+        protocol,
+        "-m",
+        "multiport",
+        "--dports",
+        # The following ports are used for default services on Ubuntu
+        "7,9,13,17,19,21,22,25,37,69,79,80,110,113",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        dstip,
+    )
+    run_iptables(
+        "-t",
+        "nat",
+        action,
+        "PREROUTING",
+        "--source",
+        srcip,
+        "-p",
+        protocol,
+        "-m",
+        "multiport",
+        "--dports",
+        # The following ports are used for default services on Ubuntu
+        "123,443,465,514,990,995,6667",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        dstip,
+    )
+
+
+def inetsim_trap(action, ipaddr, inetsim_ip, resultserver_port):
+    # There are four options for protocol in iptables: tcp, udp, icmp and all
+    # Since we want tcp, udp and icmp to be configured differently, we cannot use all
+    # tcp
+    run_iptables(
+        "-t",
+        "nat",
+        action,
         "PREROUTING",
         "--source",
         ipaddr,
         "-p",
+        "tcp",
+        "-m",
         "tcp",
         "--syn",
         "!",
@@ -277,11 +390,57 @@ def inetsim_enable(ipaddr, inetsim_ip, dns_port, resultserver_port, ports):
         "-j",
         "DNAT",
         "--to-destination",
-        "{}".format(inetsim_ip),
+        "%s:%s" % (inetsim_ip, "1"),
     )
+    # udp
+    run_iptables(
+        "-t",
+        "nat",
+        action,
+        "PREROUTING",
+        "--source",
+        ipaddr,
+        "-p",
+        "udp",
+        "!",
+        "--dport",
+        resultserver_port,
+        "-j",
+        "DNAT",
+        "--to-destination",
+        "%s:%s" % (inetsim_ip, "1"),
+    )
+    # icmp
+    run_iptables(
+        "-t",
+        "nat",
+        action,
+        "PREROUTING",
+        "--source",
+        ipaddr,
+        "-p",
+        "icmp",
+        "--icmp-type",
+        "any",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        "%s:%s" % (inetsim_ip, "1"),
+    )
+
+
+def inetsim_enable(ipaddr, inetsim_ip, dns_port, resultserver_port, ports):
+    """Enable hijacking of all traffic and send it to InetSIM."""
+    log.info("Enabling inetsim route.")
+    inetsim_redirect_port("-A", ipaddr, inetsim_ip, ports)
+    inetsim_service_port_trap("-A", ipaddr, inetsim_ip, "tcp")
+    inetsim_service_port_trap("-A", ipaddr, inetsim_ip, "udp")
+    dns_forward("-A", ipaddr, inetsim_ip, dns_port)
+    inetsim_trap("-A", ipaddr, inetsim_ip, resultserver_port)
+    # INetSim does not have an SSH service, so SSH traffic can get through to the host. We want to block this.
+    run_iptables("-A", "INPUT", "--source", ipaddr, "-p", "tcp", "-m", "tcp", "--dport", "22", "-j", "DROP")
     run_iptables("-A", "OUTPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
     run_iptables("-A", "OUTPUT", "-m", "state", "--state", "INVALID", "-j", "DROP")
-    dns_forward("-A", ipaddr, inetsim_ip, dns_port)
     run_iptables("-A", "OUTPUT", "--source", ipaddr, "-j", "DROP")
 
 
@@ -289,27 +448,13 @@ def inetsim_disable(ipaddr, inetsim_ip, dns_port, resultserver_port, ports):
     """Disable hijacking of all traffic and send it to InetSIM."""
     log.info("Disabling inetsim route.")
     inetsim_redirect_port("-D", ipaddr, inetsim_ip, ports)
-    run_iptables(
-        "-D",
-        "PREROUTING",
-        "-t",
-        "nat",
-        "--source",
-        ipaddr,
-        "-p",
-        "tcp",
-        "--syn",
-        "!",
-        "--dport",
-        resultserver_port,
-        "-j",
-        "DNAT",
-        "--to-destination",
-        "{}".format(inetsim_ip),
-    )
+    inetsim_service_port_trap("-D", ipaddr, inetsim_ip, "tcp")
+    inetsim_service_port_trap("-D", ipaddr, inetsim_ip, "udp")
+    dns_forward("-D", ipaddr, inetsim_ip, dns_port)
+    inetsim_trap("-D", ipaddr, inetsim_ip, resultserver_port)
+    run_iptables("-D", "INPUT", "--source", ipaddr, "-p", "tcp", "-m", "tcp", "--dport", "22", "-j", "DROP")
     run_iptables("-D", "OUTPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
     run_iptables("-D", "OUTPUT", "-m", "state", "--state", "INVALID", "-j", "DROP")
-    dns_forward("-D", ipaddr, inetsim_ip, dns_port)
     run_iptables("-D", "OUTPUT", "--source", ipaddr, "-j", "DROP")
 
 
@@ -334,10 +479,14 @@ def socks5_enable(ipaddr, resultserver_port, dns_port, proxy_port):
         "--to-ports",
         proxy_port,
     )
-    run_iptables("-I", "1", "OUTPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
-    run_iptables("-I", "2", "OUTPUT", "-m", "state", "--state", "INVALID", "-j", "DROP")
-    run_iptables("-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port)
-    run_iptables("-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port)
+    run_iptables("-I", "OUTPUT", "1", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
+    run_iptables("-I", "OUTPUT", "2", "-m", "state", "--state", "INVALID", "-j", "DROP")
+    run_iptables(
+        "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port
+    )
+    run_iptables(
+        "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port
+    )
     run_iptables("-A", "OUTPUT", "--source", ipaddr, "-j", "DROP")
 
 
@@ -364,13 +513,19 @@ def socks5_disable(ipaddr, resultserver_port, dns_port, proxy_port):
     )
     run_iptables("-D", "OUTPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP")
     run_iptables("-D", "OUTPUT", "-m", "state", "--state", "INVALID", "-j", "DROP")
-    run_iptables("-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port)
-    run_iptables("-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port)
+    run_iptables(
+        "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port
+    )
+    run_iptables(
+        "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "--source", ipaddr, "-j", "REDIRECT", "--to-ports", dns_port
+    )
     run_iptables("-D", "OUTPUT", "--source", ipaddr, "-j", "DROP")
 
 
 def drop_enable(ipaddr, resultserver_port):
-    run_iptables("-t", "nat", "-I", "PREROUTING", "--source", ipaddr, "-p", "tcp", "--syn", "--dport", resultserver_port, "-j", "ACCEPT")
+    run_iptables(
+        "-t", "nat", "-I", "PREROUTING", "--source", ipaddr, "-p", "tcp", "--syn", "--dport", resultserver_port, "-j", "ACCEPT"
+    )
     run_iptables("-A", "INPUT", "--destination", ipaddr, "-p", "tcp", "--dport", "8000", "-j", "ACCEPT")
     run_iptables("-A", "INPUT", "--destination", ipaddr, "-p", "tcp", "--sport", resultserver_port, "-j", "ACCEPT")
     run_iptables("-A", "OUTPUT", "--destination", ipaddr, "-p", "tcp", "--dport", "8000", "-j", "ACCEPT")
@@ -380,7 +535,9 @@ def drop_enable(ipaddr, resultserver_port):
 
 
 def drop_disable(ipaddr, resultserver_port):
-    run_iptables("-t", "nat", "-D", "PREROUTING", "--source", ipaddr, "-p", "tcp", "--syn", "--dport", resultserver_port, "-j", "ACCEPT")
+    run_iptables(
+        "-t", "nat", "-D", "PREROUTING", "--source", ipaddr, "-p", "tcp", "--syn", "--dport", resultserver_port, "-j", "ACCEPT"
+    )
     run_iptables("-D", "INPUT", "--destination", ipaddr, "-p", "tcp", "--dport", "8000", "-j", "ACCEPT")
     run_iptables("-D", "INPUT", "--destination", ipaddr, "-p", "tcp", "--sport", resultserver_port, "-j", "ACCEPT")
     run_iptables("-D", "OUTPUT", "--destination", ipaddr, "-p", "tcp", "--dport", "8000", "-j", "ACCEPT")
@@ -402,6 +559,10 @@ handlers = {
     "flush_rttable": flush_rttable,
     "forward_enable": forward_enable,
     "forward_disable": forward_disable,
+    "forward_reject_enable": forward_reject_enable,
+    "forward_reject_disable": forward_reject_disable,
+    "hostports_reject_enable": hostports_reject_enable,
+    "hostports_reject_disable": hostports_reject_disable,
     "srcroute_enable": srcroute_enable,
     "srcroute_disable": srcroute_disable,
     "inetsim_enable": inetsim_enable,
@@ -416,7 +577,7 @@ handlers = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("socket", nargs="?", default="/tmp/cuckoo-rooter", help="Unix socket path")
-    parser.add_argument("-g", "--group", default="cuckoo", help="Unix socket group")
+    parser.add_argument("-g", "--group", default="cape", help="Unix socket group")
     parser.add_argument("--systemctl", default="/bin/systemctl", help="Systemctl wrapper script for invoking OpenVPN")
     parser.add_argument("--iptables", default="/sbin/iptables", help="Path to iptables")
     parser.add_argument("--iptables-save", default="/sbin/iptables-save", help="Path to iptables-save")
@@ -429,23 +590,23 @@ if __name__ == "__main__":
         # Verbose logging is not only controlled by the level. Some INFO logs are also
         # conditional (like here).
         log.setLevel(logging.DEBUG)
-        log.info('Verbose logging enabled')
+        log.info("Verbose logging enabled")
 
-    if not settings.systemctl or not os.path.exists(settings.systemctl):
+    if not settings.systemctl or not path_exists(settings.systemctl):
         sys.exit(
             "The systemctl binary is not available, please configure it!\n"
             "Note that on CentOS you should provide --systemctl /bin/systemctl, "
             "rather than using the Ubuntu/Debian default /bin/systemctl."
         )
 
-    if not settings.iptables or not os.path.exists(settings.iptables):
+    if not settings.iptables or not path_exists(settings.iptables):
         sys.exit("The `iptables` binary is not available, eh?!")
 
     if os.getuid():
         sys.exit("This utility is supposed to be ran as root.")
 
-    if os.path.exists(settings.socket):
-        os.remove(settings.socket)
+    if path_exists(settings.socket):
+        path_delete(settings.socket)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     server.bind(settings.socket)
@@ -461,6 +622,8 @@ if __name__ == "__main__":
             "./utils/rooter.py -g myuser" % settings.group
         )
 
+    # global username
+    username = settings.group
     os.chown(settings.socket, 0, gr.gr_gid)
     os.chmod(settings.socket, stat.S_IRUSR | stat.S_IWUSR | stat.S_IWGRP)
 
@@ -472,7 +635,7 @@ if __name__ == "__main__":
 
     # Simple object to allow a signal handler to stop the rooter loop
 
-    class Run(object):
+    class Run:
         def __init__(self):
             self.run = True
 
@@ -500,7 +663,7 @@ if __name__ == "__main__":
 
         try:
             obj = json.loads(command)
-        except:
+        except Exception:
             log.info("Received invalid request: %r", command)
             continue
 
@@ -526,7 +689,9 @@ if __name__ == "__main__":
                 break
         else:
             if settings.verbose:
-                log.info("Processing command: %s %s %s", command, " ".join(args), " ".join("%s=%s" % (k, v) for k, v in kwargs.items()))
+                log.info(
+                    "Processing command: %s %s %s", command, " ".join(args), " ".join("%s=%s" % (k, v) for k, v in kwargs.items())
+                )
 
             error = None
             output = None
@@ -535,4 +700,12 @@ if __name__ == "__main__":
             except Exception as e:
                 log.exception("Error executing command: {}".format(command))
                 error = str(e)
-            server.sendto(json.dumps({"output": output, "exception": error,}).encode("utf-8"), addr)
+            server.sendto(
+                json.dumps(
+                    {
+                        "output": output,
+                        "exception": error,
+                    }
+                ).encode(),
+                addr,
+            )

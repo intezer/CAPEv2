@@ -2,10 +2,9 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import time
-import os
 import logging
+import os
+import time
 from threading import Thread
 
 from lib.api.process import Process
@@ -20,7 +19,8 @@ class Browser(Auxiliary, Thread):
     def __init__(self, options, config):
         Auxiliary.__init__(self, options, config)
         Thread.__init__(self)
-        self.do_run = True
+        self.enabled = config.browser
+        self.do_run = self.enabled
         self.seconds_elapsed = 0
 
     def stop(self):
@@ -29,14 +29,14 @@ class Browser(Auxiliary, Thread):
     def run(self):
         self.do_run = self.options.get("startbrowser", False)
         url = self.options.get("url")
-        browserdelay = int(self.options.get("browserdelay", "30"))
+        browserdelay = int(self.options.get("browserdelay", 30))
         while self.do_run:
             time.sleep(1)
-            self.seconds_elapsed = self.seconds_elapsed + 1
+            self.seconds_elapsed += 1
             if self.seconds_elapsed == browserdelay:
                 iexplore = os.path.join(os.getenv("ProgramFiles"), "Internet Explorer", "iexplore.exe")
                 ie = Process()
                 if not url:
                     url = "https://www.yahoo.com/"
-                ie.execute(path=iexplore, args='"' + url + '"', suspended=False)
+                ie.execute(path=iexplore, args=f'"{url}"', suspended=False)
                 ie.close()

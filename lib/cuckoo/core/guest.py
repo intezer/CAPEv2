@@ -2,34 +2,26 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 # https://github.com/cuckoosandbox/cuckoo/blob/master/cuckoo/core/guest.py
-from __future__ import absolute_import
-import os
-import sys
-import json
-import time
-import socket
-import logging
+
 import datetime
+import glob
+import json
+import logging
+import os
+import shutil
+import socket
+import sys
+import time
+import timeit
+from io import BytesIO
+from zipfile import ZIP_STORED, ZipFile
+
 import requests
 
-from io import BytesIO
-from zipfile import ZipFile, ZIP_STORED
-
 from lib.cuckoo.common.config import Config, parse_options
-from lib.cuckoo.common.constants import CUCKOO_ROOT
-from lib.cuckoo.common.constants import CUCKOO_GUEST_PORT, CUCKOO_GUEST_INIT
-from lib.cuckoo.common.constants import CUCKOO_GUEST_COMPLETED
-from lib.cuckoo.common.constants import CUCKOO_GUEST_FAILED
-from lib.cuckoo.common.exceptions import (
-    CuckooMachineError,
-    CuckooGuestError,
-    CuckooOperationalError,
-    CuckooMachineSnapshotError,
-    CuckooCriticalError,
-    CuckooGuestCriticalTimeout,
-)
-from lib.cuckoo.common.utils import TimeoutServer, sanitize_filename
-from lib.cuckoo.core.resultserver import ResultServer
+from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_GUEST_PORT, CUCKOO_ROOT
+from lib.cuckoo.common.exceptions import CuckooGuestCriticalTimeout, CuckooGuestError
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
 from lib.cuckoo.core.database import Database
 
 log = logging.getLogger(__name__)
@@ -39,7 +31,7 @@ cfg = Config()
 
 def analyzer_zipfile(platform):
     """Create the zip file that is sent to the Guest."""
-    t = time.time()
+    t = timeit.default_timer()
 
     zip_data = BytesIO()
     zip_file = ZipFile(zip_data, "w", ZIP_STORED)
@@ -49,9 +41,9 @@ def analyzer_zipfile(platform):
     root = os.path.join(CUCKOO_ROOT, "analyzer", platform)
     root_len = len(os.path.abspath(root))
 
-    if not os.path.exists(root):
+    if not path_exists(root):
         log.error("No valid analyzer found at path: %s", root)
-        raise CuckooGuestError("No valid analyzer found for %s platform!" % platform)
+        raise CuckooGuestError(f"No valid analyzer found for {platform} platform!")
 
     # Walk through everything inside the analyzer's folder and write
     # them to the zip archive.
@@ -61,19 +53,12 @@ def analyzer_zipfile(platform):
             path = os.path.join(root, name)
             archive_name = os.path.join(archive_root, name)
             zip_file.write(path, archive_name)
-        # ToDo remove
-        """
-        for name in os.listdir(dirpath):
-            zip_file.write(
-                os.path.join(dirpath, name), os.path.join("bin", name)
-            )
-        """
 
     zip_file.close()
     data = zip_data.getvalue()
     zip_data.close()
 
-    if time.time() - t > 10:
+    if timeit.default_timer() - t > 10:
         log.warning(
             "It took more than 10 seconds to build the Analyzer Zip for the "
             "Guest. This might be a serious performance penalty. Is your "
@@ -83,7 +68,7 @@ def analyzer_zipfile(platform):
     return data
 
 
-class GuestManager(object):
+class GuestManager:
     """This class represents the new Guest Manager. It operates on the new
     Cuckoo Agent which features a more abstract but more feature-rich API."""
 
@@ -113,7 +98,7 @@ class GuestManager(object):
     def get(self, method, *args, **kwargs):
         """Simple wrapper around requests.get()."""
         do_raise = kwargs.pop("do_raise", True)
-        url = "http://%s:%s%s" % (self.ipaddr, self.port, method)
+        url = f"http://{self.ipaddr}:{self.port}{method}"
         with requests.Session() as session:
             session.trust_env = False
             session.proxies = None
@@ -124,7 +109,7 @@ class GuestManager(object):
                 raise CuckooGuestError(
                     "CAPE Agent failed without error status, please try "
                     "upgrading to the latest version of agent.py (>= 0.10) and "
-                    "notify us if the issue persists."
+                    "notify us if the issue persists"
                 )
 
         do_raise and r.raise_for_status()
@@ -132,7 +117,7 @@ class GuestManager(object):
 
     def post(self, method, *args, **kwargs):
         """Simple wrapper around requests.post()."""
-        url = "http://%s:%s%s" % (self.ipaddr, self.port, method)
+        url = f"http://{self.ipaddr}:{self.port}{method}"
         session = requests.Session()
         session.trust_env = False
         session.proxies = None
@@ -143,7 +128,7 @@ class GuestManager(object):
             raise CuckooGuestError(
                 "CAPE Agent failed without error status, please try "
                 "upgrading to the latest version of agent.py (>= 0.10) and "
-                "notify us if the issue persists."
+                "notify us if the issue persists"
             )
 
         r.raise_for_status()
@@ -151,21 +136,21 @@ class GuestManager(object):
 
     def wait_available(self):
         """Wait until the Virtual Machine is available for usage."""
-        end = time.time() + self.timeout
+        start = timeit.default_timer()
 
         while db.guest_get_status(self.task_id) == "starting" and self.do_run:
             try:
                 socket.create_connection((self.ipaddr, self.port), 1).close()
                 break
             except socket.timeout:
-                log.debug("%s: not ready yet", self.vmid)
+                log.debug("Task #%s: %s is not ready yet", self.task_id, self.vmid)
             except socket.error:
-                log.debug("%s: not ready yet", self.vmid)
+                log.debug("Task #%s: %s is not ready yet", self.task_id, self.vmid)
                 time.sleep(1)
 
-            if time.time() > end:
+            if timeit.default_timer() - start > self.timeout:
                 raise CuckooGuestCriticalTimeout(
-                    "Machine %s: the guest initialization hit the critical timeout, analysis aborted." % self.vmid
+                    f"Machine {self.vmid}: the guest initialization hit the critical timeout, analysis aborted"
                 )
 
     def query_environ(self):
@@ -188,7 +173,7 @@ class GuestManager(object):
 
     def determine_system_drive(self):
         if self.platform == "windows":
-            return "%s/" % self.environ["SYSTEMDRIVE"]
+            return f"{self.environ['SYSTEMDRIVE']}/"
         return "/"
 
     def determine_temp_path(self):
@@ -200,7 +185,9 @@ class GuestManager(object):
         """Upload the analyzer to the Virtual Machine."""
         zip_data = analyzer_zipfile(self.platform)
 
-        log.debug("Uploading analyzer to guest (id=%s, ip=%s, size=%d)", self.vmid, self.ipaddr, len(zip_data))
+        log.debug(
+            "Task #%s: Uploading analyzer to guest (id=%s, ip=%s, size=%d)", self.task_id, self.vmid, self.ipaddr, len(zip_data)
+        )
 
         self.determine_analyzer_path()
         data = {
@@ -216,38 +203,38 @@ class GuestManager(object):
         for key, value in options.items():
             # Encode datetime objects the way xmlrpc encodes them.
             if isinstance(value, datetime.datetime):
-                config.append("%s = %s" % (key, value.strftime("%Y%m%dT%H:%M:%S")))
+                config.append(f"{key} = {value.strftime('%Y%m%dT%H:%M:%S')}")
             else:
-                config.append("%s = %s" % (key, value))
+                config.append(f"{key} = {value}")
 
         data = {
             "filepath": os.path.join(self.analyzer_path, "analysis.conf"),
         }
         self.post("/store", files={"file": "\n".join(config)}, data=data)
 
-    def upload_support_files(self, options):
-        """ Upload supporting files from zip temp directory if they exist
-        :param options: options
-        :return:
-        """
-        log.info("Uploading support files to guest (id={}, ip={})".format(self.vmid, self.ipaddr))
-        basedir = os.path.dirname(options["target"])
+    def upload_scripts(self):
+        """Upload various scripts such as pre_script and during_scripts."""
+        log.info("Task #%s: Uploading script files to guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+        # Temp File location of pre_script and during_script
+        base_dir = os.path.join("/tmp/cuckoo-tmp", str(self.task_id))
+        # File path of Analyses path. Storage of script
+        analyses_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(self.task_id), "scripts")
+        # Create folder in Analyses
+        path_mkdir(analyses_path, exist_ok=True)
 
-        for dirpath, _, files in os.walk(basedir):
-            for xf in files:
-                target = os.path.join(dirpath, xf)
-                # Copy all files except for the original target
-                if not target == options["target"]:
-                    data = {"filepath": os.path.join(self.determine_temp_path(), xf)}
-                    files = {"file": (xf, open(target, "rb"))}
-                    self.post("/store", files=files, data=data)
-        return
+        for name in glob.glob(os.path.join(base_dir, "*_script.*")):
+            # Copy file to Analyses/{task_ID}/scripts
+            shutil.copy(name, analyses_path)
+            basename = os.path.basename(name)
+            data = {"filepath": os.path.join(self.determine_temp_path(), basename).replace("/", "\\")}
+            files = {"file": (basename, open(name, "rb"))}
+            self.post("/store", files=files, data=data)
 
     def start_analysis(self, options):
         """Start the analysis by uploading all required files.
         @param options: the task options
         """
-        log.info("Starting analysis #%s on guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+        log.info("Task #%s: Starting analysis on guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
 
         self.options = options
         self.timeout = options["timeout"] + cfg.timeouts.critical
@@ -280,17 +267,17 @@ class GuestManager(object):
             status = r.json()
             version = status.get("version")
             features = status.get("features", [])
-        except:
+        except Exception:
             log.critical(
                 "We were unable to detect Agent in the "
                 "Guest VM, are you sure you have set it up correctly? Please "
                 "go through the documentation once more and otherwise inform "
-                "the Cuckoo Developers of your issue."
+                "the Cuckoo Developers of your issue"
             )
             db.guest_set_status(self.task_id, "failed")
             return
 
-        log.info("Guest is running CAPE Agent %s (id=%s, ip=%s)", version, self.vmid, self.ipaddr)
+        log.info("Task #%s: Guest is running CAPE Agent %s (id=%s, ip=%s)", self.task_id, version, self.vmid, self.ipaddr)
 
         # Pin the Agent to our IP address so that it is not accessible by
         # other Virtual Machines etc.
@@ -309,18 +296,27 @@ class GuestManager(object):
         # ToDo fix it
         # self.aux.callback("prepare_guest")
 
+        # ToDo https://github.com/kevoreilly/CAPEv2/issues/1468
+        # Lookup file if current doesn't exist in TMP anymore
+        alternative_path = False
+        if not path_exists(options["target"]):
+            path_found = db.sample_path_by_hash(task_id=options["id"])
+            if path_found:
+                alternative_path = path_found[0]
+
+        sample_path = alternative_path or options["target"]
         # If the target is a file, upload it to the guest.
-        if options["category"] == "file" or options["category"] == "archive":
+        if options["category"] in ("file", "archive"):
             data = {
                 "filepath": os.path.join(self.determine_temp_path(), options["file_name"]),
             }
             files = {
-                "file": ("sample.bin", open(options["target"], "rb")),
+                "file": ("sample.bin", open(sample_path, "rb")),
             }
             self.post("/store", files=files, data=data)
 
-        # check for support files and upload them to guest.
-        self.upload_support_files(options)
+        # upload additional scripts
+        self.upload_scripts()
 
         # Debug analyzer.py in vm
         if "CAPE_DBG" in os.environ:
@@ -329,7 +325,7 @@ class GuestManager(object):
 
         if "execpy" in features:
             data = {
-                "filepath": "%s/analyzer.py" % self.analyzer_path,
+                "filepath": os.path.join(self.analyzer_path, "analyzer.py"),
                 "async": "yes",
                 "cwd": self.analyzer_path,
             }
@@ -337,7 +333,7 @@ class GuestManager(object):
         else:
             # Execute the analyzer that we just uploaded.
             data = {
-                "command": "%s %s\\analyzer.py" % (sys.executable, self.analyzer_path),
+                "command": f"{sys.executable} {self.analyzer_path}\\analyzer.py",
                 "async": "yes",
                 "cwd": self.analyzer_path,
             }
@@ -346,11 +342,11 @@ class GuestManager(object):
     def wait_for_completion(self):
 
         count = 0
-        end = time.time() + self.timeout
+        start = timeit.default_timer()
 
         while db.guest_get_status(self.task_id) == "running" and self.do_run:
             if count >= 5:
-                log.debug("%s: analysis #%s is still running", self.vmid, self.task_id)
+                log.debug("Task #%s: Analysis is still running (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
                 count = 0
 
             count += 1
@@ -358,27 +354,37 @@ class GuestManager(object):
 
             # If the analysis hits the critical timeout, just return straight
             # away and try to recover the analysis results from the guest.
-            if time.time() > end:
-                log.info("%s: end of analysis reached!", self.vmid)
+            if timeit.default_timer() - start > self.timeout:
+                log.info("Task #%s: End of analysis reached! (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
                 return
 
             try:
                 status = self.get("/status", timeout=5).json()
-            except CuckooGuestError:
+            except (CuckooGuestError, requests.exceptions.ReadTimeout):
                 # this might fail due to timeouts or just temporary network
                 # issues thus we don't want to abort the analysis just yet and
                 # wait for things to recover
-                log.warning(f"Virtual Machine: {self.vmid} /status failed. This can indicate the guest losing network connectivity")
+                log.warning(
+                    "Task #%s: Virtual Machine %s /status failed. This can indicate the guest losing network connectivity",
+                    self.task_id,
+                    self.vmid,
+                )
                 continue
             except Exception as e:
-                log.error(f"Virtual machine: {self.vmid} /status failed. %s", e, exc_info=True)
+                log.error("Task #%s: Virtual machine %s /status failed. %s", self.task_id, self.vmid, e, exc_info=True)
                 continue
 
             if status["status"] == "complete":
-                log.info("%s: analysis completed successfully", self.vmid)
+                log.info("Task #%s: Analysis completed successfully (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
                 db.guest_set_status(self.task_id, "complete")
                 return
             elif status["status"] == "exception":
-                log.warning("%s: analysis #%s caught an exception\n%s", self.vmid, self.task_id, status["description"])
+                log.warning(
+                    "Task #%s: Analysis caught an exception (id=%s, ip=%s)\n%s",
+                    self.task_id,
+                    self.vmid,
+                    self.ipaddr,
+                    status["description"],
+                )
                 db.guest_set_status(self.task_id, "failed")
                 return

@@ -44,7 +44,7 @@ rule AgentTeslaV2 {
     meta:
         author = "ditekshen"
         description = "AgenetTesla Type 2 Keylogger payload"
-        cape_type = "AgentTeslaV2 Payload"
+        cape_type = "AgentTesla Payload"
     strings:
         $s1 = "get_kbHook" ascii
         $s2 = "GetPrivateProfileString" ascii
@@ -70,7 +70,7 @@ rule AgentTeslaV3 {
     meta:
       author = "ditekshen"
       description = "AgentTeslaV3 infostealer payload"
-      cape_type = "AgentTeslaV3 payload"
+      cape_type = "AgentTesla payload"
     strings:
         $s1 = "get_kbok" fullword ascii
         $s2 = "get_CHoo" fullword ascii
@@ -85,6 +85,14 @@ rule AgentTeslaV3 {
         $s11 = "credential" fullword wide
         $s12 = "AccountConfiguration+" wide
         $s13 = "<a.+?href\\s*=\\s*([\"'])(?<href>.+?)\\1[^>]*>" fullword wide
+        $s14 = "set_Lenght" fullword ascii
+        $s15 = "get_Keys" fullword ascii
+        $s16 = "set_AllowAutoRedirect" fullword ascii
+        $s17 = "set_wtqQe" fullword ascii
+        $s18 = "set_UseShellExecute" fullword ascii
+        $s19 = "set_IsBodyHtml" fullword ascii
+        $s20 = "set_FElvMn" fullword ascii
+        $s21 = "set_RedirectStandardOutput" fullword ascii
 
         $g1 = "get_Clipboard" fullword ascii
         $g2 = "get_Keyboard" fullword ascii
@@ -100,4 +108,17 @@ rule AgentTeslaV3 {
         $m5 = "\\WindowsLoad%ftphost%/%ftpuser%%ftppassword%STORLengthWriteCloseGetBytesOpera" ascii
     condition:
         (uint16(0) == 0x5a4d and (8 of ($s*) or (6 of ($s*) and all of ($g*)))) or (2 of ($m*))
+}
+
+rule AgentTeslaV4 {
+    meta:
+        author = "Rony (r0ny_123)"
+        cape_type = "AgentTesla payload"
+    strings:
+        $decode_1 = { 06 91 06 61 20 [4] 61 d2 9c 06 17 58 0a } // seen in other AgentTesla samples
+        $decode_2 = { 91 06 1a 58 4a 61 d2 61 d2 52 } // seen in XorStringsNET obfuscated AgentTesla
+    condition:
+        uint16be(0) == 0x4d5a
+        and uint32(uint32(0x3C)) == 0x00004550
+        and any of them
 }

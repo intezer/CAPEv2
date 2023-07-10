@@ -1,17 +1,16 @@
-from __future__ import absolute_import
+import sys
 from datetime import datetime
 
 # http://pythoncentral.io/introductory-tutorial-python-sqlalchemy/
-from sqlalchemy import Column, ForeignKey, Integer, Text, Table, String, Boolean, Index, DateTime, or_, and_, desc
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.sql import func
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Table, Text, create_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
 Base = declarative_base()
 
-schema = 'b0fa23c3c9c0'
+schema = "b0fa23c3c9c0"
+
 
 class ExitNodes(Base):
     """Exit nodes to route traffic."""
@@ -22,7 +21,7 @@ class ExitNodes(Base):
     name = Column(String(255), nullable=False, unique=True)
 
     def __repr__(self):
-        return "<Exit node('{0}','{1}')>".format(self.id, self.name)
+        return f"<Exit node('{self.id}','{self.name}')>"
 
     def __init__(self, name):
         self.name = name
@@ -35,20 +34,6 @@ worker_exitnodes = Table(
     Column("node_id", Integer, ForeignKey("node.id")),
     Column("exit_id", Integer, ForeignKey("exitnodes.id")),
 )
-
-
-class Node(Base):
-    """Cuckoo node database model."""
-
-    __tablename__ = "node"
-    id = Column(Integer, primary_key=True)
-    name = Column(Text, nullable=False)
-    url = Column(Text, nullable=True)
-    enabled = Column(Boolean, default=False)
-    apikey = Column(String(255), nullable=False)
-    last_check = Column(DateTime(timezone=False))
-    machines = relationship("Machine", backref="node", lazy="dynamic")
-    exitnodes = relationship("ExitNodes", secondary=worker_exitnodes, backref="node", lazy="subquery")
 
 
 class StringList(TypeDecorator):
@@ -72,6 +57,20 @@ class Machine(Base):
     platform = Column(Text, nullable=False)
     tags = Column(StringList)
     node_id = Column(Integer, ForeignKey("node.id"))
+
+
+class Node(Base):
+    """Cuckoo node database model."""
+
+    __tablename__ = "node"
+    id = Column(Integer, primary_key=True)
+    name = Column(Text, nullable=False)
+    url = Column(Text, nullable=True)
+    enabled = Column(Boolean, default=False)
+    apikey = Column(String(255), nullable=False)
+    last_check = Column(DateTime(timezone=False))
+    machines = relationship(Machine, backref="node", lazy="dynamic")
+    exitnodes = relationship(ExitNodes, secondary=worker_exitnodes, backref="node", lazy="subquery")
 
 
 class Task(Base):
@@ -147,9 +146,11 @@ class Task(Base):
         self.route = route
 
 
-def create_session(db_connectionn, echo=False):
-    # ToDo add chema version check
-    engine = create_engine(db_connectionn, echo=echo) # pool_size=40, max_overflow=0,
-    Base.metadata.create_all(engine)
-    session = sessionmaker(autocommit=False, autoflush=True, bind=engine)
-    return session
+def create_session(db_connectionn: str, echo=False) -> sessionmaker:
+    # ToDo add schema version check
+    try:
+        engine = create_engine(db_connectionn, echo=echo)  # pool_size=40, max_overflow=0,
+        Base.metadata.create_all(engine)
+        return sessionmaker(autoflush=True, bind=engine)
+    except OperationalError as e:
+        sys.exit(e)

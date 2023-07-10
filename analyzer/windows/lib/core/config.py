@@ -2,21 +2,20 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import configparser
 
 
 class Config:
     def __init__(self, cfg):
         """@param cfg: configuration file."""
-        config = configparser.ConfigParser(allow_no_value=True)
+        config = configparser.ConfigParser(allow_no_value=True, interpolation=None)
         config.read(cfg)
 
         for section in config.sections():
             for name, raw_value in config.items(section):
                 if name == "file_name":
                     value = config.get(section, name)
-                    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+                    if len(value) >= 2 and value[0] == value[-1] == "'":
                         value = value[1:-1]
                 else:
                     try:
@@ -39,13 +38,13 @@ class Config:
         # Here we parse such options and provide a dictionary that will be made
         # accessible to the analysis package.
         options = {}
-        if hasattr(self, "options") and isinstance(self.options, str):
+        if isinstance(getattr(self, "options", None), str):
             # Split the options by comma.
             fields = self.options.split(",")
             for field in fields:
                 try:
                     key, value = field.split("=", 1)
-                except ValueError as e:
+                except ValueError:
                     pass
                 else:
                     # If the parsing went good, we add the option to the

@@ -4,13 +4,13 @@
 # the GNU General Public License version 2
 #
 # Credit to JPCERT - this is derived from https://github.com/JPCERTCC/aa-tools/blob/master/tscookie_decode.py
-#
-from __future__ import absolute_import
-import sys
-import pefile
-import re
+
 import collections
+import re
+import sys
 from struct import unpack, unpack_from
+
+import pefile
 
 # Resource pattern
 RESOURCE_PATTERNS = [
@@ -35,6 +35,7 @@ CONFIG_PATTERNS = [
 ]
 CONFIG_SIZE = 0x8D4
 
+
 # RC4
 def rc4(data, key):
     x = 0
@@ -56,7 +57,7 @@ def rc4(data, key):
 
 # helper function for formatting string
 def __format_string(data):
-    return data.split("\x00")[0]
+    return data.split("\x00", 1)[0]
 
 
 # Parse config
@@ -64,14 +65,16 @@ def parse_config(config):
     config_dict = collections.OrderedDict()
     for i in range(4):
         if config[0x10 + 0x100 * i] != "\x00":
-            config_dict["Server name #" + str(i + 1)] = __format_string(unpack_from("<240s", config, 0x10 + 0x100 * i)[0].decode("utf-16"))
-            config_dict["Main port #" + str(i + 1)] = unpack_from("<H", config, 0x4 + 0x100 * i)[0]
-            config_dict["Backup port #" + str(i + 1)] = unpack_from("<H", config, 0x8 + 0x100 * i)[0]
+            config_dict[f"Server name #{i + 1}"] = __format_string(
+                unpack_from("<240s", config, 0x10 + 0x100 * i)[0].decode("utf-16")
+            )
+            config_dict[f"Main port #{i + 1}"] = unpack_from("<H", config, 0x4 + 0x100 * i)[0]
+            config_dict[f"Backup port #{i + 1}"] = unpack_from("<H", config, 0x8 + 0x100 * i)[0]
     if config[0x400] != "\x00":
         config_dict["Proxy server"] = __format_string(unpack_from("<128s", config, 0x400)[0].decode("utf-16"))
         config_dict["Proxy port"] = unpack_from("<H", config, 0x480)[0]
     config_dict["ID"] = __format_string(unpack_from("<256s", config, 0x500)[0].decode("utf-16"))
-    config_dict["Key"] = "0x{0:X}".format(unpack_from(">I", config, 0x604)[0])
+    config_dict["Key"] = f"0x{unpack_from('>I', config, 0x604)[0]:X}"
     config_dict["Sleep time"] = unpack_from("<H", config, 0x89C)[0]
     return config_dict
 
@@ -83,7 +86,7 @@ def decode_resource(rc_data, key_end, fname):
         rc4key = rc_data[-RC4_KEY_LENGTH:-4] + key_end
         dec_data = rc4(enc_data, rc4key)
         open(fname, "wb").write(dec_data)
-    except:
+    except Exception:
         return
     return dec_data
 
@@ -114,10 +117,10 @@ def load_resource(pe, data):
                 if resource_id == 104:
                     resource_id = ord(unpack("c", data[mr.start() + 21])[0])
                 break
-            except:
+            except Exception:
                 return
     if not mr:
-        sys.exit("[!] Resource id not found.")
+        sys.exit("[!] Resource id not found")
 
     for idx in pe.DIRECTORY_ENTRY_RESOURCE.entries:
         if str(idx.name) in str(resource_name):
@@ -127,16 +130,16 @@ def load_resource(pe, data):
                         data_rva = entry.directory.entries[0].data.struct.OffsetToData
                         size = entry.directory.entries[0].data.struct.Size
                         rc_data = pe.get_memory_mapped_image()[data_rva : data_rva + size]
-                    except:
+                    except Exception:
                         return
 
     return rc_data
 
 
-def config(data):
+def extract_config(data):
     try:
         dll = pefile.PE(data=data)
-    except:
+    except Exception:
         return None
 
     for pattern in CONFIG_PATTERNS:
@@ -146,7 +149,7 @@ def config(data):
                 (config_rva,) = unpack("=I", data[mc.start() + 3 : mc.start() + 7])
                 config_addr = dll.get_physical_by_rva(config_rva - dll.NT_HEADERS.OPTIONAL_HEADER.ImageBase)
                 enc_config_data = data[config_addr : config_addr + CONFIG_SIZE]
-            except:
+            except Exception:
                 return
 
     for pattern in RESOURCE_PATTERNS:
@@ -155,13 +158,13 @@ def config(data):
     if mr2:
         rc2_data = load_resource(dll, data)
         key_end = load_rc4key(data)
-        decode_resource(rc2_data, key_end, "TSCookie" + ".2nd.decode")
+        decode_resource(rc2_data, key_end, "TSCookie.2nd.decode")
 
     try:
         enc_config = enc_config_data[4:]
         rc4key = enc_config_data[:4]
         config = rc4(enc_config, rc4key)
-    except:
+    except Exception:
         return
 
     return parse_config(config)

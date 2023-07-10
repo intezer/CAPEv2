@@ -2,13 +2,9 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import tempfile
-from nose.tools import assert_equals
 
-from lib.cuckoo.common.constants import CUCKOO_VERSION
 from lib.cuckoo.common.abstracts import Processing, Signature
+from lib.cuckoo.common.constants import CUCKOO_VERSION
 
 
 class ProcessingMock(Processing):
@@ -20,19 +16,18 @@ class ProcessingMock(Processing):
 
 class SignatureMock(Signature):
     name = "mock"
-    minimum = CUCKOO_VERSION.split("-")[0]
-    maximum = CUCKOO_VERSION.split("-")[0]
+    minimum = CUCKOO_VERSION.split("-", 1)[0]
+    maximum = CUCKOO_VERSION.split("-", 1)[0]
 
     def run(self, results):
         if "foo" in results:
             return True
-        else:
-            return False
+        return False
 
 
 class SignatureAlterMock(SignatureMock):
     def run(self, results):
-        results = None
+        results = None  # noqa: F841
 
 
 class SignatureDisabledMock(SignatureMock):

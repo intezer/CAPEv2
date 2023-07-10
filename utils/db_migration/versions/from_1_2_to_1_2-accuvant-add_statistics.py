@@ -11,30 +11,26 @@ Create Date: 2015-03-05 07:39:21.036983
 """
 
 # revision identifiers, used by Alembic.
-from __future__ import absolute_import
-from __future__ import print_function
-
 revision = "4b09c454108c"
 down_revision = "495d5a6edef3"
-
-from alembic import op
-import sqlalchemy as sa
 
 import os.path
 import sys
 from datetime import datetime
 
+import sqlalchemy as sa
+
 try:
     from dateutil.parser import parse
 except ImportError:
     print("Unable to import dateutil.parser", end=" ")
-    print("(install with `pip3 install python-dateutil`)")
+    print("(install with `poetry run pip install python-dateutil`)")
     sys.exit()
 
 try:
     from alembic import op
 except ImportError:
-    print("Unable to import alembic (install with `pip3 install alembic`)")
+    print("Unable to import alembic (install with `poetry run pip install alembic`)")
     sys.exit()
 
 curdir = os.path.abspath(os.path.dirname(__file__))

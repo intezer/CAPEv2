@@ -5,7 +5,7 @@ These files help run all the various parts of CAPE as systemd services, so that 
 - `cape-rooter.service` - Runs `rooter.py`
 - `cape-processor.service` - Runs `process.py`
 - `cape.service` - Runs `cuckoo.py`
-- `cape-web.service` - Runs the Cuckoo web interface as a WSGI application using Gunicorn bound to `127.0.0.1:8000`
+- `cape-web.service` - Runs the Cuckoo web interface as a WSGI application using UWSGI/Gunicorn bound to `127.0.0.1:8000`
 
 ## Setup
 0. You need to edit the default values in systemd to not get `too many open files`
@@ -47,17 +47,14 @@ These files help run all the various parts of CAPE as systemd services, so that 
     virtualenv /opt/CAPEv2/venv
     ```
 
-6. (optional) Install required Python packages inside the virtualenv
-    * dependencies now installed by https://github.com/doomedraven/Tools/blob/master/Sandbox/cape2.sh
-
-7. Edit configuration files in `/opt/CAPEv2/conf` as needed
-8. Return to your user
+6. Edit configuration files in `/opt/CAPEv2/conf` as needed
+7. Return to your user
 
     ```bash
     exit
     ```
 
-9. Install the `systemd` service unit configuration files(you need modify ExecStart= if you using virtualenv, just comment current one and uncomment another one)
+8. Install the `systemd` service unit configuration files(you need modify ExecStart= if you using virtualenv, just comment current one and uncomment another one)
 
     ```bash
     sudo cp /opt/CAPE/systemd/*.service /etc/systemd/system

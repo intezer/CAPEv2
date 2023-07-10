@@ -2,23 +2,19 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import json
 import logging
 import os
 import shutil
-
-from multiprocessing import Lock
-
 from collections import defaultdict
 from datetime import datetime, timedelta
+from multiprocessing import Lock
 
-from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.abstracts import Report
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
-from lib.cuckoo.common.exceptions import CuckooReportError
-from lib.cuckoo.core.database import Database, Task, TASK_REPORTED
-from bson.objectid import ObjectId
+from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir, path_write_file
+from lib.cuckoo.core.database import TASK_REPORTED, Database, Task
 
 log = logging.getLogger(__name__)
 repconf = Config("reporting")
@@ -26,59 +22,14 @@ db = Database()
 lock = Lock()
 
 # Global connections
-if repconf.mongodb and repconf.mongodb.enabled:
-    from pymongo import MongoClient
+if repconf.mongodb.enabled:
+    from dev_utils.mongodb import mongo_delete_data
 
-    results_db = MongoClient(
-        repconf.mongodb.host,
-        port=repconf.mongodb.port,
-        username=repconf.mongodb.get("username", None),
-        password=repconf.mongodb.get("password", None),
-        authSource = repconf.mongodb.get("authsource", "cuckoo")
-    )[repconf.mongodb.get("db", "cuckoo")]
+if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
+    from dev_utils.elasticsearchdb import delete_analysis_and_related_calls, elastic_handler
 
-if repconf.elasticsearchdb and repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
-    from elasticsearch import Elasticsearch
+    es = elastic_handler
 
-    idx = repconf.elasticsearchdb.index + "-*"
-    try:
-        es = Elasticsearch(hosts=[{"host": repconf.elasticsearchdb.host, "port": repconf.elasticsearchdb.port,}], timeout=60,)
-    except Exception as e:
-        log.warning("Unable to connect to ElasticSearch: %s", str(e))
-
-
-def delete_mongo_data(curtask, tid):
-    # TODO: Class-ify this or make it a function in utils, some code reuse
-    # between this/process.py/django view
-    analyses = results_db.analysis.find({"info.id": int(tid)})
-    if analyses.count() > 0:
-        for analysis in analyses:
-            for process in analysis.get("behavior", {}).get("processes", []):
-                for call in process["calls"]:
-                    results_db.calls.remove({"_id": ObjectId(call)})
-            results_db.analysis.remove({"_id": ObjectId(analysis["_id"])})
-        log.debug("Task #{0} deleting MongoDB data for Task #{1}".format(curtask, tid))
-
-"""
-def delete_elastic_data(curtask, tid):
-    # TODO: Class-ify this or make it a function in utils, some code reuse
-    # between this/process.py/django view
-    analyses = es.search(index=fullidx, doc_type="analysis", q='info.id: "{0}"'.format(tid))["hits"]["hits"]
-    if len(analyses) > 0:
-        for analysis in analyses:
-            esidx = analysis["_index"]
-            esid = analysis["_id"]
-            if analysis["_source"]["behavior"]:
-                for process in analysis["_source"]["behavior"]["processes"]:
-                    for call in process["calls"]:
-                        es.delete(
-                            index=esidx, doc_type="calls", id=call,
-                        )
-            es.delete(
-                index=esidx, doc_type="analysis", id=esid,
-            )
-        log.debug("Task #{0} deleting ElasticSearch data for Task #{1}".format(curtask, tid))
-"""
 
 def delete_files(curtask, delfiles, target_id):
     delfiles_list = delfiles
@@ -90,15 +41,15 @@ def delete_files(curtask, delfiles, target_id):
         if os.path.isdir(delent):
             try:
                 shutil.rmtree(delent)
-                log.debug("Task #{0} deleting {1} due to retention quota".format(curtask, delent))
+                log.debug("Task #%s deleting %s due to retention quota", curtask, delent)
             except (IOError, OSError) as e:
-                log.warn("Error removing {0}: {1}".format(delent, e))
-        elif os.path.exists(delent):
+                log.warn("Error removing %s: %s", delent, e)
+        elif path_exists(delent):
             try:
-                os.remove(delent)
-                log.debug("Task #{0} deleting {1} due to retention quota".format(curtask, delent))
+                path_delete(delent)
+                log.debug("Task #%s deleting %s due to retention quota", curtask, delent)
             except OSError as e:
-                log.warn("Error removing {0}: {1}".format(delent, e))
+                log.warn("Error removing %s: %s", delent, e)
 
 
 class Retention(Report):
@@ -123,19 +74,18 @@ class Retention(Report):
         # process.py manually, the directiry structure is created in the
         # startup of cuckoo.py
         retPath = os.path.join(CUCKOO_ROOT, "storage", "retention")
-
         confPath = os.path.join(CUCKOO_ROOT, "conf", "reporting.conf")
 
         if not os.path.isdir(retPath):
-            log.warn("Retention log directory doesn't exist. Creating it now.")
-            os.mkdir(retPath)
+            log.warn("Retention log directory doesn't exist, creating it now")
+            path_mkdir(retPath)
         else:
             try:
                 taskFile = os.path.join(retPath, "task_check.log")
                 with open(taskFile, "r") as taskLog:
                     taskCheck = json.loads(taskLog.read())
             except Exception as e:
-                log.warn("Failed to load retention log, if this is not the " "time running retention, review the error: {0}".format(e))
+                log.warn("Failed to load retention log, if this is not the time running retention, review the error: %s", e)
             curtime = datetime.now()
             since_retlog_modified = curtime - datetime.fromtimestamp(os.path.getmtime(taskFile))
             since_conf_modified = curtime - datetime.fromtimestamp(os.path.getmtime(confPath))
@@ -165,11 +115,11 @@ class Retention(Report):
             retentions = self.options
             del retentions["enabled"]
             del retentions["run_every"]
-            saveTaskLogged = dict()
+            saveTaskLogged = {}
             for item in retentions.keys():
                 # We only want to query the database for tasks that we have
                 # retentions set for.
-                if self.options[item] == False:
+                if not self.options[item]:
                     continue
                 # Sanitation
                 if item not in taskCheck or taskCheck[item] == 0:
@@ -183,23 +133,20 @@ class Retention(Report):
                     # We need to delete some data
                     for tid in buf:
                         lastTask = tid.to_dict()["id"]
-                        if item != "mongo" and item != "elastic":
+                        if item not in ("mongo", "elastic"):
                             delete_files(curtask, delLocations[item], lastTask)
                         elif item == "mongo":
-                            if repconf.mongodb and repconf.mongodb.enabled:
-                                delete_mongo_data(curtask, lastTask)
-                        """
+                            if repconf.mongodb.enabled:
+                                mongo_delete_data([lastTask])
                         elif item == "elastic":
-                            if repconf.elasticsearchdb and repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
-                                delete_elastic_data(curtask, lastTask)
-                        """
+                            if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
+                                delete_analysis_and_related_calls(lastTask)
                     saveTaskLogged[item] = int(lastTask)
                 else:
                     saveTaskLogged[item] = 0
 
             # Write the task log for future reporting, to avoid returning tasks
             # that we have already deleted data from.
-            with open(os.path.join(retPath, "task_check.log"), "w") as taskLog:
-                taskLog.write(json.dumps(saveTaskLogged))
+            _ = path_write_file(os.path.join(retPath, "task_check.log"), json.dumps(saveTaskLogged), mode="text")
         finally:
             lock.release()

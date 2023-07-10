@@ -2,13 +2,29 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from ctypes import *
+from ctypes import (
+    POINTER,
+    WINFUNCTYPE,
+    Structure,
+    Union,
+    c_bool,
+    c_char,
+    c_double,
+    c_int,
+    c_ubyte,
+    c_uint,
+    c_ulonglong,
+    c_ushort,
+    c_void_p,
+    c_wchar_p,
+    windll,
+)
 
 NTDLL = windll.ntdll
 KERNEL32 = windll.kernel32
 ADVAPI32 = windll.advapi32
 USER32 = windll.user32
+SHELL32 = windll.shell32
 PDH = windll.pdh
 
 BYTE = c_ubyte
@@ -21,6 +37,7 @@ ULONG = c_uint
 UINT64 = c_ulonglong
 LPBYTE = POINTER(c_ubyte)
 LPTSTR = POINTER(c_char)
+PWSTR = c_wchar_p
 HANDLE = c_void_p
 PVOID = c_void_p
 LPVOID = c_void_p
@@ -39,6 +56,7 @@ INFINITE = 0xFFFFFFFF
 PROCESS_ALL_ACCESS = 0x001F0FFF
 THREAD_ALL_ACCESS = 0x001F03FF
 TOKEN_ALL_ACCESS = 0x000F01FF
+PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
 SE_PRIVILEGE_ENABLED = 0x00000002
 STILL_ACTIVE = 0x00000103
 
@@ -93,8 +111,8 @@ SHARD_PATHA = 0x00000002
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
-GENERIC_EXECUTE           = 0x20000000
-GENERIC_ALL               = 0x10000000
+GENERIC_EXECUTE = 0x20000000
+GENERIC_ALL = 0x10000000
 
 OPEN_EXISTING = 0x00000003
 
@@ -105,15 +123,14 @@ CF_TEXT = 0x0001
 
 PDH_FMT_DOUBLE = 0x00000200
 
-FILE_SHARE_READ   = 0x00000001
-FILE_SHARE_WRITE  = 0x00000002
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
 FILE_SHARE_DELETE = 0x00000004
 
-
-CREATE_NEW    = 1
+CREATE_NEW = 1
 CREATE_ALWAYS = 2
 OPEN_EXISTING = 3
-OPEN_ALWAYS   = 4
+OPEN_ALWAYS = 4
 TRUNCATE_EXISTING = 5
 CREATE_NO_WINDOW = 0x08000000
 
@@ -307,6 +324,7 @@ class PDH_FMT_COUNTERVALUE(Structure):
         ("CStatus", DWORD),
         ("doubleValue", DOUBLE),
     ]
+
 
 EnumWindowsProc = WINFUNCTYPE(c_bool, POINTER(c_int), POINTER(c_int))
 EnumChildProc = WINFUNCTYPE(c_bool, POINTER(c_int), POINTER(c_int))

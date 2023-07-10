@@ -2,10 +2,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
 import re
-from lib.common.decode_vbe_jse import DecodeVBEJSE
 
 
 def choose_package(file_type, file_name, exports, target):
@@ -35,12 +32,14 @@ def choose_package(file_type, file_name, exports, target):
             return "dll"
     elif "PE32" in file_type or "MS-DOS" in file_type:
         return "exe"
-    elif file_name.endswith((".msi",".msp",".appx")) or "MSI Installer" in file_type:
+    elif file_name.endswith((".msi", ".msp", ".appx")) or "MSI Installer" in file_type:
         return "msi"
     elif file_type.startswith('Audio file') or file_name.endswith('.mp3'):
         return "wmplayer"
     elif file_name.endswith(".pub"):
         return "pub"
+    elif file_name.endswith(".one"):
+        return "one"
     elif (
         "Rich Text Format" in file_type
         or "Microsoft Word" in file_type
@@ -53,7 +52,9 @@ def choose_package(file_type, file_name, exports, target):
     elif (
         "Microsoft Office Excel" in file_type
         or "Microsoft Excel" in file_type
-        or file_name.endswith((".xls", ".xlt", ".xlm", ".xlsx", ".xltx", ".xlsm", ".xltm", ".xlsb", ".xla", ".xlam", ".xll", ".xlw", ".slk", ".csv"))
+        or file_name.endswith(
+            (".xls", ".xlt", ".xlm", ".xlsx", ".xltx", ".xlsm", ".xltm", ".xlsb", ".xla", ".xlam", ".xll", ".xlw", ".slk", ".csv")
+        )
     ):
         return "xls"
     elif "PowerPoint" in file_type or file_name.endswith(
@@ -74,20 +75,33 @@ def choose_package(file_type, file_name, exports, target):
         return "python"
     elif file_name.endswith(".ps1"):
         return "ps1"
-    elif file_name.endswith(".msg"):
+    elif file_name.endswith((".msg", ".rpmsg")) or "rpmsg Restricted Permission Message" in file_type:
         return "msg"
-    elif file_name.endswith((".eml", ".ics")) or "vCalendar calendar" in file_type:
+    elif file_name.endswith((".eml", ".ics")) or (
+        "RFC 822 mail" in file_type
+        or "old news" in file_type
+        or "mail forwarding" in file_type
+        or "smtp mail" in file_type
+        or "news" in file_type
+        or "news or mail" in file_type
+        or "saved news" in file_type
+        or "MIME entity" in file_type
+        or "vCalendar calendar" in file_type
+    ):
         return "eml"
     elif file_name.endswith((".js", ".jse")):
         return "js"
-    elif file_name.endswith((".htm", ".html")):
-        return "html"
     elif file_name.endswith(".hta"):
         return "hta"
     elif file_name.endswith(".xps"):
         return "xps"
     elif "HTML" in file_type:
-        return "html"
+        if file_name.endswith(".wsf") or file_name.endswith(".wsc"):
+            return "wsf"
+        elif re.search(b'(?:<hta\\:application|<script\\s+language\\s*=\\s*"(J|VB|Perl)Script")', file_content, re.I):
+            return "html"
+        else:
+            return "chrome"
     elif file_name.endswith(".mht"):
         return "mht"
     elif file_name.endswith(".url") or "MS Windows 95 Internet shortcut" in file_type or "Windows URL shortcut" in file_type:
@@ -105,7 +119,7 @@ def choose_package(file_type, file_name, exports, target):
     elif file_name.endswith((".xsl", ".xslt")) or "XSL stylesheet" in file_type:
         return "xslt"
     elif file_name.endswith(".sct"):
-        if re.search(br"(?is)<\?XML.*?<scriptlet.*?<registration",file_content):
+        if re.search(rb"(?is)<\?XML.*?<scriptlet.*?<registration", file_content):
             return "sct"
         else:
             return "hta"
@@ -113,9 +127,9 @@ def choose_package(file_type, file_name, exports, target):
         return "wsf"
     elif "PDF" in file_type or file_name.endswith(".pdf"):
         return "pdf"
-    elif re.search(b"<script\\s+language=\"(J|VB|Perl)Script\"",file_content,re.I):
+    elif re.search(b'<script\\s+language="(J|VB|Perl)Script"', file_content, re.I):
         return "wsf"
-    elif file_name.endswith((".vbs", ".vbe")) or re.findall(br"\s?Dim\s", file_content, re.I):
+    elif file_name.endswith((".vbs", ".vbe")) or re.findall(rb"\s?Dim\s", file_content, re.I):
         return "vbs"
     elif b"Set-StrictMode" in file_content[:100]:
         return "ps1"
@@ -125,14 +139,7 @@ def choose_package(file_type, file_name, exports, target):
         return "ichitaro"
     elif file_name.endswith(".reg"):
         return "reg"
-    elif b"#@~^" in file_content[:100]:
-        data = DecodeVBEJSE(file_content, "")
-        if data:
-            if re.findall(br"\s?Dim\s", data, re.I):
-                return "vbs"
-            else:
-                return "js"
-        else:
-            return "vbejse"
+    elif "ISO 9660" in file_type or file_name.endswith((".iso", ".udf", ".vhd")):
+        return "archive"
     else:
         return "generic"

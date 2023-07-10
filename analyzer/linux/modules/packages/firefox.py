@@ -3,12 +3,11 @@
 # This software may be modified and distributed under the terms
 # of the MIT license. See the LICENSE file for details.
 
-from os import system
 from lib.core.packages import Package
 
 
 class Ff(Package):
-    """ Firefox analysys package. """
+    """Firefox analysys package."""
 
     def prepare(self):
         self.args = [self.target] + self.args

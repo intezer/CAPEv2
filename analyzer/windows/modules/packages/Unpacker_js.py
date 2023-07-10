@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import os
 
 from lib.common.abstracts import Package
@@ -15,8 +14,10 @@ class Unpacker_JS(Package):
         ("SystemRoot", "system32", "wscript.exe"),
     ]
 
-    def __init__(self, options={}, config=None):
+    def __init__(self, options=None, config=None):
         """@param options: options dict."""
+        if options is None:
+            options = {}
         self.config = config
         self.options = options
         self.options["unpacker"] = "1"
@@ -25,14 +26,16 @@ class Unpacker_JS(Package):
 
     def start(self, path):
         wscript = self.get_path("wscript.exe")
-        args = '"%s"' % path
+        args = f'"{path}"'
         ext = os.path.splitext(path)[-1].lower()
-        if ext != ".js" and ext != ".jse":
-            if os.path.isfile(path) and "#@~^" in open(path, "rb").read(100):
-                os.rename(path, path + ".jse")
-                path = path + ".jse"
+        if ext not in (".js", ".jse"):
+            with open(path, "r") as tmpfile:
+                magic_bytes = tmpfile.read(4)
+            if magic_bytes == "#@~^":
+                os.rename(path, f"{path}.jse")
+                path = f"{path}.jse"
             else:
-                os.rename(path, path + ".js")
-                path = path + ".js"
-        args = '"%s"' % path
+                os.rename(path, f"{path}.js")
+                path = f"{path}.js"
+        args = f'"{path}"'
         return self.execute(wscript, args, path)

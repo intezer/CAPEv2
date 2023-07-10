@@ -2,10 +2,8 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-
 LOCAL_SETTINGS = True
-from .settings import *
+from .settings import *  # noqa: F403
 
 # If you want to customize your cuckoo path set it here.
 # CUCKOO_PATH = "/where/cuckoo/is/placed/"
@@ -37,24 +35,23 @@ DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
 # Uncomment for deployment with NGINX
-#STATIC_ROOT = ""
-#STATIC_ROOT = os.path.join(os.getcwd(), "static")
+# STATIC_ROOT = ""
+# STATIC_ROOT = os.path.join(os.getcwd(), "static")
 
 SOCIALACCOUNT_PROVIDERS = {
-    'google': {
-        'SCOPE': [
-            'profile',
-            'email',
+    "google": {
+        "SCOPE": [
+            "profile",
+            "email",
         ],
-        'AUTH_PARAMS': {
-            'access_type': 'online',
-        }
+        "AUTH_PARAMS": {
+            "access_type": "online",
+        },
     },
-    'github': {
-        'SCOPE': [
-            'user',
-            'repo',
-            'read:org',
+    "github": {
+        "SCOPE": [
+            "read:user",
+            "user:email",
         ],
     },
 }

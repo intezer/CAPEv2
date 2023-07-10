@@ -2,10 +2,8 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-
-from __future__ import absolute_import
-import os
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
 
 
 class XLS2207(Package):
@@ -14,17 +12,12 @@ class XLS2207(Package):
     def __init__(self, options={}, config=None):
         self.config = config
         self.options = options
-        self.options["exclude-apis"] = "memcpy"
 
     PATHS = [
         ("ProgramFiles", "Microsoft Office*", "root", "Office16", "EXCEL.EXE"),
     ]
 
     def start(self, path):
-        if "." not in os.path.basename(path):
-            new_path = path + ".xls"
-            os.rename(path, new_path)
-            path = new_path
-
-        excel = self.get_path_glob("Microsoft Office Excel")
-        return self.execute(excel, '"%s" /dde' % path, path)
+        path = check_file_extension(path, ".xls")
+        excel = self.get_path_glob("EXCEL.EXE")
+        return self.execute(excel, f'"{path}" /dde', path)

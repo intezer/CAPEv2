@@ -2,15 +2,12 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import datetime
-import os
 import pathlib
 
 import pytest
-from lib.cuckoo.common.netlog import BsonParser
-from bson.binary import Binary
 
+from lib.cuckoo.common.netlog import BsonParser
 
 # Might require newer pymongo, works with 3.11.4
 
@@ -57,5 +54,5 @@ class TestBsonParser:
             1976,
             476,
             b"C:\\Windows\\sysnative\\lsass.exe",
-            b"lsass.exe",
+            "lsass.exe",
         )

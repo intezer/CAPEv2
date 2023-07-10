@@ -4,19 +4,21 @@
 # See the file 'docs/LICENSE' for copying permission.
 # MAEC 5.0 Cuckoo Report Module
 # https://maecproject.github.io/releases/5.0/MAEC_Vocabularies_Specification.pdf
-from __future__ import absolute_import
+
 import io
-import sys
 import json
+import logging
 import os
 import re
+import sys
 import uuid
-import logging
-import dateutil.parser
 from collections import OrderedDict
+from contextlib import suppress
+
+import dateutil.parser
+
 from lib.cuckoo.common.abstracts import Report
 from lib.cuckoo.common.constants import CUCKOO_ROOT
-import six
 
 log = logging.getLogger(__name__)
 
@@ -137,18 +139,17 @@ def convert_to_unicode(input):
             od[convert_to_unicode(key)] = convert_to_unicode(value)
         return od
     elif isinstance(input, dict):
-        return {convert_to_unicode(key): convert_to_unicode(value) for key, value in six.iteritems(input)}
+        return {convert_to_unicode(key): convert_to_unicode(value) for key, value in input.items()}
     elif isinstance(input, list):
         return [convert_to_unicode(element) for element in input]
-    elif isinstance(input, str) or isinstance(input, int) or isinstance(input, float):
-        return six.text_type(input).decode("utf-8")
-    else:
-        return input
+    elif isinstance(input, (str, int, float)):
+        return str(input)
+    return input
 
 
 def sort_dict(d):
     """Sort and return an observed dict for an input dictionary"""
-    od = OrderedDict(sorted(six.iteritems(d), key=lambda k_v: sort_order.index(k_v[0])))
+    od = OrderedDict(sorted(d.items(), key=lambda k_v: sort_order.index(k_v[0])))
     return od
 
 
@@ -191,7 +192,7 @@ class MaecReport(Report):
     def setup(self):
         """Setup core MAEC fields and types"""
         # Package ID
-        self.package["id"] = "package--" + str(uuid.uuid4())
+        self.package["id"] = f"package--{uuid.uuid4()}"
         # Load the JSON mappings
 
         with open(os.path.join(CUCKOO_ROOT, "data", "maec_api_call_mappings.json")) as f:
@@ -209,7 +210,7 @@ class MaecReport(Report):
         """Create a base Malware Instance"""
         malwareInstance = {"type": "malware-instance"}
 
-        malwareInstance["id"] = "malware-instance--" + str(uuid.uuid4())
+        malwareInstance["id"] = f"malware-instance--{uuid.uuid4()}"
 
         # Create file object for the malware instance object
         file_obj_id, file_obj = self.create_file_obj(file_data)
@@ -226,28 +227,28 @@ class MaecReport(Report):
     def setup_primary_malware_instance(self):
         """Instantiate the primary (target) Malware Instance"""
         malwareInstance = {}
-        if "target" in self.results and self.results["target"]["category"] == "file":
+        if self.results.get("target", {}).get("category") == "file":
             malwareInstance = self.create_malware_instance(self.results["target"]["file"])
 
             # Add dynamic features
             malwareInstance["dynamic_features"] = {}
 
             # Grab static strings
-            if "strings" in self.results and self.results["strings"]:
+            if self.results.get("strings"):
                 malwareInstance["static_features"] = {"strings": self.results["strings"]}
 
             # if target malware has virus total scans, add them to the Malware
             # Instance's corresponding STIX file object
-            if "virustotal" in self.results and self.results["virustotal"]:
+            if self.results.get("virustotal"):
                 file_obj_id = malwareInstance["instance_object_refs"][0]
                 self.package["observable_objects"][file_obj_id]["extensions"] = {}
                 self.package["observable_objects"][file_obj_id]["extensions"]["x-maec-avclass"] = self.create_avc_class_obj_list(
                     self.results["virustotal"]
                 )
 
-        elif "target" in self.results and self.results["target"]["category"] == "url":
+        elif self.results.get("target")["category"] == "url":
             malwareInstance = {"type": "malware-instance"}
-            malwareInstance["id"] = "malware-instance--" + str(uuid.uuid4())
+            malwareInstance["id"] = f"malware-instance--{uuid.uuid4()}"
             malwareInstance["instance_object_refs"] = [{"type": "url", "value": self.results["target"]["url"]}]
             # Add malwareInstance to package
             self.package["maec_objects"].append(sort_dict(malwareInstance))
@@ -268,7 +269,7 @@ class MaecReport(Report):
                 vm_obj = {"type": "software", "name": (str(self.results["info"]["machine"]["manager"]))}
                 analysis_dict["vm_ref"] = self.deduplicate_obj(vm_obj)
             analysis_dict["tool_refs"] = [tool_id]
-            analysis_dict["description"] = str("Automated analysis conducted " "by Cuckoo Sandbox")
+            analysis_dict["description"] = "Automated analysis conducted by Cuckoo Sandbox"
             malwareInstance["analysis_metadata"] = [analysis_dict]
             self.primaryInstance = malwareInstance
 
@@ -291,7 +292,7 @@ class MaecReport(Report):
             # Add relationship object to connect original malware instance and
             # new malware instance (from dropped file)
             relationship_dict = OrderedDict()
-            relationship_dict["id"] = "relationship--" + str(uuid.uuid4())
+            relationship_dict["id"] = f"relationship--{uuid.uuid4()}"
             relationship_dict["type"] = "relationship"
             relationship_dict["source_ref"] = self.primaryInstance["id"]
             relationship_dict["target_ref"] = malwareInstance["id"]
@@ -314,9 +315,9 @@ class MaecReport(Report):
             "name": cuckoo_file_dict["name"],
         }
 
-        if "ssdeep" in cuckoo_file_dict and cuckoo_file_dict["ssdeep"]:
+        if cuckoo_file_dict.get("ssdeep"):
             file_obj["hashes"]["ssdeep"] = cuckoo_file_dict["ssdeep"]
-        if "type" in cuckoo_file_dict and cuckoo_file_dict["type"]:
+        if cuckoo_file_dict.get("type"):
             file_obj["mime_type"] = _get_mime_type(cuckoo_file_dict["type"])
 
         # If file path given, have to create another STIX object
@@ -324,15 +325,15 @@ class MaecReport(Report):
 
         # Dropped files use the "file_path" field for the actual directory of
         # dropped file
-        if "filepath" in cuckoo_file_dict and cuckoo_file_dict["filepath"]:
+        if cuckoo_file_dict.get("filepath"):
             self.create_directory_from_file_path(file_obj, cuckoo_file_dict["path"])
 
         # Target file uses the "path" field for recording directory
-        elif "path" in cuckoo_file_dict and cuckoo_file_dict["path"]:
+        elif cuckoo_file_dict.get("path"):
             self.create_directory_from_file_path(file_obj, cuckoo_file_dict["path"])
 
         # If file has virusTotal scans, insert them under extensions property
-        if "virustotal" in cuckoo_file_dict and cuckoo_file_dict["virustotal"]:
+        if cuckoo_file_dict.get("virustotal"):
             file_obj["extensions"] = {}
             file_obj["extensions"]["x-maec-avclass"] = self.create_avc_class_obj_list(cuckoo_file_dict["virustotal"])
 
@@ -343,7 +344,7 @@ class MaecReport(Report):
 
         file_name = re.split(r"\\|/", path)[-1]
         # Make sure we have a file name and not just a directory
-        if file_name or ("name" in file_obj and file_obj["name"] != path):
+        if file_name or (file_obj.get("name") != path):
             dir_path = path.rstrip(file_name)
             dir_obj = self.create_directory_obj(dir_path)
             # Add the file name to the File Object if it does not already exist
@@ -432,7 +433,7 @@ class MaecReport(Report):
         elif re.match("^([0-9a-fA-F][0-9a-fA-F]:){5}([0-9a-fA-F][0-9a-fA-F])$", value):
             network_obj["type"] = "mac-addr"
         # Test for an IPv4 address
-        elif re.match("^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})" "(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]" "|[0-9]{1,2})){3}$", value):
+        elif re.match("^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[0-9]{1,2})){3}$", value):
             network_obj["type"] = "ipv4-addr"
             obj["protocols"] = ["ipv4", "tcp"]
         else:
@@ -457,7 +458,7 @@ class MaecReport(Report):
 
     def map_object_properties(self, obj, mapping_entry, arguments):
         """Map the properties of a Cuckoo-reported Object to its STIX
-         Cyber Observable Representation"""
+        Cyber Observable Representation"""
         obj_dict = {}
         # Handle object extensions
         if "extension" in mapping_entry:
@@ -493,27 +494,25 @@ class MaecReport(Report):
         # Populate the properties of the Object
         if not isinstance(arguments, list):
             arguments = [arguments]
-        found = False
-        v2_arguments = dict()
+        v2_arguments = {}
         for args in arguments:
             if "name" in args and "value" in args:
                 v2_arguments[args["name"]] = args["value"]
         arguments = v2_arguments
-        try:
+        with suppress(Exception):
             for entry in mapping[objects_class]:
-                if entry["cuckoo_arg"] in arguments and arguments[entry["cuckoo_arg"]]:
+                if arguments.get(entry["cuckoo_arg"]):
                     self.map_object_properties(obj, entry, arguments)
             # Make sure that some properties on the Object have actually been set
             if len(list(obj.keys())) > 1:
                 action[objects_class] = []
                 real_obj_id = self.post_process_object(obj, arguments)
                 action[objects_class].append(real_obj_id)
-        except Exception as e:
-            pass
 
     def post_process_object(self, obj, arguments):
         """Perform any necessary post-processing on Cyber Observable Objects"""
         protocol_mappings = {"1": "ftp", "3": "http"}
+        """
         reg_datatype_mappings = {
             "0": "REG_NONE",
             "1": "REG_SZ",
@@ -528,13 +527,14 @@ class MaecReport(Report):
             "10": "REG_RESOURCE_REQUIREMENTS_LIST",
             "11": "REG_QWORD",
         }
+        """
         if obj["type"] == "file":
             self.create_directory_from_file_path(obj, obj["name"])
         elif obj["type"] == "windows-registry-key":
             if "regkey" in arguments and "regkey_r" in arguments and "values" in obj:
-                obj["key"] = obj["key"].replace("\\" + (arguments["regkey_r"]), "").rstrip()
+                obj["key"] = obj["key"].replace(f"\\{arguments['regkey_r']}", "").rstrip()
             elif "regkey" in arguments and "key_name" in arguments and "values" in obj:
-                obj["key"] = obj["key"].replace("\\" + (arguments["key_name"]), "").rstrip()
+                obj["key"] = obj["key"].replace(f"\\{arguments['key_name']}", "").rstrip()
             # Do some post-processing on Registry Values
             # if 'values' in obj and 'data_type' in obj['values'][0]:
             #    obj['values'][0]['data_type'] = reg_datatype_mappings[
@@ -561,7 +561,7 @@ class MaecReport(Report):
         """Create a MAEC Action from a Cuckoo API call"""
         action = {"type": "malware-action"}
         " todo change action to type"
-        action["id"] = mapping["action_name"] + "--" + str(uuid.uuid4())
+        action["id"] = f"{mapping['action_name']}--{uuid.uuid4()}"
         action["name"] = mapping["action_name"]
         action["timestamp"] = dateutil.parser.parse(call["timestamp"]).isoformat()
         # Map any input objects
@@ -708,7 +708,9 @@ class MaecReport(Report):
                         else:
                             names = [x["name"] for x in (capability["refined_capabilities"])]
                             if capability_mappings[name_chunk]["refined_capabilities"][0]["name"] not in names:
-                                (capability["refined_capabilities"]).append(capability_mappings[name_chunk]["refined_capabilities"][0])
+                                (capability["refined_capabilities"]).append(
+                                    capability_mappings[name_chunk]["refined_capabilities"][0]
+                                )
                         if capability not in capabilities:
                             capabilities.append(capability)
         if capabilities:
@@ -718,23 +720,22 @@ class MaecReport(Report):
         if not results.get("ttps") or not hasattr(self, "mitre"):
             return
 
-        maec_attcks = list()
-        for tactic in self.mitre.tactics:
+        maec_attcks = []
+        for tactic in self.mitre.enterprise.tactics:
             for technique in tactic.techniques:
-                if technique.id in list(results["ttps"].keys()):
-                    maec_attck = OrderedDict()
-
-                    maec_attck.setdefault(tactic.name, list())
-                    maec_attck[tactic.name].append(
-                        {
-                            "technique_id": technique.id,
-                            "ttp_name": technique.name,
-                            "description": technique.description,
-                            "signature": results["ttps"][technique.id],
+                if results["ttps"]:
+                    list_of_ttps = [dictionary["ttp"] for dictionary in results["ttps"]]
+                    if technique.id in list_of_ttps:
+                        maec_attck = {
+                            tactic.name: {
+                                "technique_id": technique.id,
+                                "ttp_name": technique.name,
+                                "description": technique.description,
+                                "signature": results["ttps"][list_of_ttps.index(technique.id)]["signature"],
+                            }
                         }
-                    )
 
-                    maec_attcks.append(maec_attck)
+                        maec_attcks.append(maec_attck)
 
         if maec_attcks:
             self.primaryInstance["mitre_attck"] = maec_attcks

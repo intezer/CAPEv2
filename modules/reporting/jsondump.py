@@ -2,25 +2,35 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import os
-try:
-    import orjson
-    HAVE_ORJSON = True
-except ImportError:
-    import json
-    HAVE_ORJSON = False
 
 from lib.cuckoo.common.abstracts import Report
 from lib.cuckoo.common.exceptions import CuckooReportError
+from lib.cuckoo.common.path_utils import path_write_file
+
+try:
+    import orjson
+
+    HAVE_ORJSON = True
+except ImportError:
+    import json
+
+    HAVE_ORJSON = False
 
 
 class JsonDump(Report):
     """Saves analysis results in JSON format."""
-    
+
+    # ensure we run after the SubmitCAPE
+    order = 10
+
     def default(self, obj):
         if isinstance(obj, bytes):
-            return obj.decode('utf8')
+            try:
+                result = obj.decode()
+            except UnicodeDecodeError:
+                result = f"UnicodeDecodeError, bytes hex str: {obj.hex()}"
+            return result
         raise TypeError
 
     def run(self, results):
@@ -32,10 +42,11 @@ class JsonDump(Report):
         try:
             path = os.path.join(self.reports_path, "report.json")
             if HAVE_ORJSON:
-                with open(path, "wb") as report:
-                    report.write(orjson.dumps(results, option=orjson.OPT_INDENT_2, default=self.default)) # orjson.OPT_SORT_KEYS |
+                _ = path_write_file(
+                    path, orjson.dumps(results, option=orjson.OPT_INDENT_2, default=self.default)
+                )  # orjson.OPT_SORT_KEYS |
             else:
                 with open(path, "w") as report:
                     json.dump(results, report, sort_keys=False, indent=int(indent), ensure_ascii=False)
         except (UnicodeError, TypeError, IOError) as e:
-            raise CuckooReportError("Failed to generate JSON report: %s" % e)
+            raise CuckooReportError(f"Failed to generate JSON report: {e}")

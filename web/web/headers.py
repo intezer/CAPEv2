@@ -2,15 +2,13 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import sys
+from contextlib import suppress
 
 from django.conf import settings
 
-try:
+with suppress(Exception):
     from django.utils.deprecation import MiddlewareMixin
-except:
-    pass
 
 sys.path.append(settings.CUCKOO_PATH)
 
@@ -22,6 +20,7 @@ class CuckooHeaders(MiddlewareMixin):
 
     def __init__(self, get_response):
         self.get_response = get_response
+        self._is_coroutine = False
 
     def process_response(self, request, response):
         response["Server"] = "Machete Server"
@@ -32,5 +31,7 @@ class CuckooHeaders(MiddlewareMixin):
         response["Pragma"] = "no-cache"
         response["Cache-Control"] = "no-cache"
         response["Expires"] = "0"
-        response["Permissions-Policy"] = "accelerometer=(); autoplay=(); camera=(); encrypted-media=(); fullscreen=(); geolocation=(); gyroscope=(); magnetometer=(); microphone=(); midi=(); payment=(); picture-in-picture=(); sync-xhr=(); usb=();"
+        response[
+            "Permissions-Policy"
+        ] = "accelerometer=(); autoplay=(); camera=(); encrypted-media=(); fullscreen=(); geolocation=(); gyroscope=(); magnetometer=(); microphone=(); midi=(); payment=(); picture-in-picture=(); sync-xhr=(); usb=();"
         return response

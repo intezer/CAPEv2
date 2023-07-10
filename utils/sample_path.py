@@ -1,40 +1,25 @@
-from __future__ import absolute_import
-from __future__ import print_function
+import argparse
 import os
 import sys
-import pymongo
 
 CUCKOO_ROOT = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..")
 sys.path.append(CUCKOO_ROOT)
 
 from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.core.database import Database
 
-
 repconf = Config("reporting")
-if len(sys.argv) == 2:
-    db = Database()
-    paths = db.sample_path_by_hash(sys.argv[1])
-    if paths is not None:
-        paths = [path for path in paths if os.path.exists(path)]
+
+if "__main__" == __name__:
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hash", help="Hash to lookup", default=None, action="store", required=False)
+    parser.add_argument("--id", help="Get hash by sample_id from task", default=None, action="store", required=False)
+    args = parser.parse_args()
+
+    paths = Database().sample_path_by_hash(sample_hash=args.hash, task_id=args.id)
+    if paths:
+        paths = [path for path in paths if path_exists(path)]
         if paths:
-            print(("Found by db.sample_path_by_hash: {}".format(sys.argv[1])))
-            print(paths)
-    else:
-        results_db = pymongo.MongoClient(
-            repconf.mongodb.host,
-            port=repconf.mongodb.port,
-            username=repconf.mongodb.get("username", None),
-            password=repconf.mongodb.get("password", None),
-            authSource = repconf.mongodb.get("authsource", "cuckoo"),
-        )[repconf.mongodb.db]
-        tasks = results_db.analysis.find({"dropped.sha256": sys.argv[1]})
-        if tasks:
-            for task in tasks:
-                path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["info"]["id"]), "files", sys.argv[1])
-                if os.path.exists(path):
-                    paths = [path]
-                    print(("Found by dropped in mongo: {}".format(sys.argv[1])))
-                    break
-else:
-    print("provide hash to search")
+            print("\n".join(paths))

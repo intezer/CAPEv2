@@ -298,6 +298,28 @@ Acepts as params status to check for status and/or option to search by option LI
         </td>
       </tr>
       <tr>
+          <td>Reprocess Task</td>
+          {% if config.taskreprocess.enabled %}
+              <td><span class="badge badge-success">Yes</span></td>
+          {% else %}
+              <td><span class="badge badge-danger">No</span></td>
+          {% endif %}
+          <td>
+              <ul>
+                  <li>RPS: {{ config.taskreprocess.rps }}</li>
+                  <li>RPM: {{ config.taskreprocess.rpm }}</li>
+              </ul>
+          </td>
+          <td>Mark an analysis task as ready to be processed. Return object will be JSON.</td>
+          <td><a class="accordion-toggle" data-toggle="collapse" href="#taskreprocess" aria-expanded="false" aria-controls="#taskreprocess">Example</a>
+          </td>
+      </tr>
+      <tr class="collapse" id="taskreprocess">
+          <td colspan="5">
+              <pre>curl {{ config.api.url }}/apiv2/tasks/reprocess/[task id]/</pre>
+          </td>
+      </tr>
+      <tr>
         <td>Delete Task</td>
         {% if config.taskdelete.enabled %}
         <td><span class="badge badge-success">Yes</span></td>
@@ -363,6 +385,7 @@ Acepts as params status to check for status and/or option to search by option LI
         <td colspan="5">
           <pre>curl {{ config.api.url }}/apiv2/tasks/get/report/[task id]/
 curl {{ config.api.url }}/apiv2/tasks/get/report/[task id]/[format]/
+curl {{ config.api.url }}/apiv2/tasks/get/report/[task id]/[format]/zip/
 Note: Format can be json/maec/maec5/metadata/lite/all.
 Note 2: extra formats: all/dist/dropped/lite - used for distributed cluster reporting
 </pre>
@@ -537,7 +560,7 @@ curl {{ config.api.url }}/apiv2/tasks/get/procmemory/[task id]/[pid]/</pre>
             <li>RPM: {{ config.sampledl.rpm }}</li>
           </ul>
         </td>
-        <td>Download a sample from a Task by Task ID/MD5/SHA1/SHA256. Return object will be octet-stream. (.bin)</td>
+        <td>Download a sample from a Task by Task ID/MD5/SHA1/SHA256. Supports zip-encryption with default password. Return object will be octet-stream. (.bin) or application/zip. (.zip) if encrypted</td>
         <td><a class="accordion-toggle" data-toggle="collapse" href="#sampledl" aria-expanded="false" aria-controls="#sampledl">Example</a>
         </td>
       </tr>
@@ -546,7 +569,12 @@ curl {{ config.api.url }}/apiv2/tasks/get/procmemory/[task id]/[pid]/</pre>
           <pre>curl {{ config.api.url }}/apiv2/files/get/task/[task id]/
 curl {{ config.api.url }}/apiv2/files/get/md5/[md5 hash]/
 curl {{ config.api.url }}/apiv2/files/get/sha1/[sha1 hash]/
-curl {{ config.api.url }}/apiv2/files/get/sha256/[sha256 hash]/</pre>
+curl {{ config.api.url }}/apiv2/files/get/sha256/[sha256 hash]/
+
+curl {{ config.api.url }}/apiv2/files/get/task/[task id]/?encrypted=1
+curl {{ config.api.url }}/apiv2/files/get/md5/[md5 hash]/?encrypted=1
+curl {{ config.api.url }}/apiv2/files/get/sha1/[sha1 hash]/?encrypted=1
+curl {{ config.api.url }}/apiv2/files/get/sha256/[sha256 hash]/?encrypted=1</pre>
         </td>
       </tr>
       <tr>
@@ -595,15 +623,15 @@ curl {{ config.api.url }}/apiv2/files/get/sha256/[sha256 hash]/</pre>
       </tr>
       <tr>
         <td>Get tasks ids finished in latest X hours</td>
-        {% if config.latests.enabled %}
+        {% if config.tasks_latest.enabled %}
         <td><span class="badge badge-success">Yes</span></td>
         {% else %}
         <td><span class="badge badge-danger">No</span></td>
         {% endif %}
         <td>
           <ul>
-            <li>RPS: {{ config.latests.rps }}</li>
-            <li>RPM: {{ config.latests.rpm }}</li>
+            <li>RPS: {{ config.tasks_latest.rps }}</li>
+            <li>RPM: {{ config.tasks_latest.rpm }}</li>
           </ul>
         </td>
         <td>View ids of tasks finished on latest X hours.</td>

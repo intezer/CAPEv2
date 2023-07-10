@@ -2,19 +2,18 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-
-from __future__ import absolute_import
-import os
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
 
 
 class XLS(Package):
     """Excel analysis package."""
 
-    def __init__(self, options={}, config=None):
+    def __init__(self, options=None, config=None):
+        if options is None:
+            options = {}
         self.config = config
         self.options = options
-        self.options["exclude-apis"] = "memcpy"
 
     PATHS = [
         ("ProgramFiles", "Microsoft Office", "EXCEL.EXE"),
@@ -23,10 +22,7 @@ class XLS(Package):
     ]
 
     def start(self, path):
-        if "." not in os.path.basename(path):
-            new_path = path + ".xls"
-            os.rename(path, new_path)
-            path = new_path
-
-        excel = self.get_path_glob("Microsoft Office Excel")
-        return self.execute(excel, '"%s" /dde' % path, path)
+        if not path.endswith((".xls", ".xlsx")):
+            path = check_file_extension(path, ".xls")
+        excel = self.get_path_glob("EXCEL.EXE")
+        return self.execute(excel, f'"{path}" /dde', path)

@@ -2,18 +2,16 @@
 # Copyright (C) 2015 Dmitry Rodionov
 # This software may be modified and distributed under the terms
 # of the MIT license. See the LICENSE file for details.
-from __future__ import absolute_import
-
-from lib.common.apicalls import apicalls
 
 import inspect
-from os import sys, path, waitpid, environ
 import logging
-import time
 import subprocess
-from lib.common.results import NetlogFile
-from lib.core.config import Config
+import timeit
+from os import environ, path, sys, waitpid
+
 from lib.api.process import Process
+from lib.common.apicalls import apicalls
+from lib.common.results import NetlogFile
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +27,7 @@ def choose_package_class(file_type=None, file_name="", suggestion=None):
             log.info(file_name)
             name = "generic"
 
-    full_name = "modules.packages.%s" % name
+    full_name = f"modules.packages.{name}"
     try:
         # FIXME(rodionovd):
         # I couldn't figure out how to make __import__ import anything from
@@ -39,20 +37,21 @@ def choose_package_class(file_type=None, file_name="", suggestion=None):
         # from this module and then try to figure out the required member class
         module = __import__(full_name, globals(), locals(), ["*"])
     except ImportError:
-        raise Exception('Unable to import package "{0}": it does not ' "exist.".format(name))
+        raise Exception(f'Unable to import package "{name}": it does not exist')
     try:
         pkg_class = _found_target_class(module, name)
     except IndexError as err:
-        raise Exception("Unable to select package class (package={0}): " "{1}".format(full_name, err))
+        raise Exception(f"Unable to select package class (package={full_name}): {err}")
     return pkg_class
 
 
 def _found_target_class(module, name):
-    """ Searches for a class with the specific name: it should be
+    """Searches for a class with the specific name: it should be
     equal to capitalized $name.
     """
-    members = inspect.getmembers(module, inspect.isclass)
-    return [x[1] for x in members if x[0] == name.capitalize()][0]
+    for member in inspect.getmembers(module, inspect.isclass):
+        if member[0] == name.capitalize():
+            return member[1]
 
 
 def _guess_package_name(file_type, file_name):
@@ -72,22 +71,21 @@ def _guess_package_name(file_type, file_name):
         return "generic"
     elif "Unicode text" in file_type or file_name.endswith(".js"):
         return "js"
-    else:
-        return None
+    return None
 
 
-class Package(object):
-    """ Base analysis package """
+class Package:
+    """Base analysis package"""
 
     def __init__(self, target, **kwargs):
         if not target:
-            raise Exception("Package(): `target` and `host` arguments are required")
+            raise Exception("Package(): 'target' and 'host' arguments are required")
 
         self.target = target
         # Any analysis options?
         self.options = kwargs.get("options", {})
         # A timeout for analysis
-        self.timeout = kwargs.get("timeout", None)
+        self.timeout = kwargs.get("timeout")
         # Command-line arguments for the target.
 
         self.args = self.options.get("args", [])
@@ -96,7 +94,7 @@ class Package(object):
         # Should our target be launched as root or not
         self.run_as_root = _string_to_bool(self.options.get("run_as_root", "False"))
         # free: do not inject our monitor.
-        self.free = self.options.get("free", None)
+        self.free = self.options.get("free")
         self.proc = None
         self.pids = []
 
@@ -107,22 +105,22 @@ class Package(object):
         self.pids = pids
 
     def prepare(self):
-        """ Preparation routine. Do anything you want here. """
+        """Preparation routine. Do anything you want here."""
         pass
 
     def start(self):
-        """ Runs an analysis process.
+        """Runs an analysis process.
         This function is a generator.
         """
         target_name = self.options.get("filename")
         if target_name:
             filepath = path.join(environ.get("TEMP", "/tmp"), target_name)
             # Remove the trailing slash (if any)
-            if filepath.endswith("/"):
-                self.target = filepath[:-1]
-            else:
-                self.target = filepath
+            self.target = filepath.rstrip("/")
         self.prepare()
+        self.normal_analysis()
+        return self.proc.pid
+        """
         if self.free:
             self.normal_analysis()
             return self.proc.pid
@@ -130,7 +128,8 @@ class Package(object):
             self.apicalls_analysis()
             return self.proc.pid
         else:
-            raise Exception("Unsupported analysis method. Try `apicalls`.")
+            raise Exception("Unsupported analysis method. Try 'apicalls'")
+        """
 
     def check(self):
         """Check."""
@@ -162,30 +161,34 @@ class Package(object):
         kwargs = {"args": self.args, "timeout": self.timeout, "run_as_root": self.run_as_root}
         log.info(self.target)
         cmd = apicalls(self.target, **kwargs)
-        stap_start = time.time()
+        stap_start = timeit.default_timer()
         log.info(cmd)
-        self.proc = subprocess.Popen(cmd, env={"XAUTHORITY": "/root/.Xauthority", "DISPLAY": ":0"}, stderr=subprocess.PIPE, shell=True)
+        self.proc = subprocess.Popen(
+            cmd, env={"XAUTHORITY": "/root/.Xauthority", "DISPLAY": ":0"}, stderr=subprocess.PIPE, shell=True
+        )
 
-        while "systemtap_module_init() returned 0" not in self.proc.stderr.readline().decode():
+        while b"systemtap_module_init() returned 0" not in self.proc.stderr.readline():
             # log.debug(self.proc.stderr.readline())
             pass
 
-        stap_stop = time.time()
-        log.info("Process startup took %.2f seconds" % (stap_stop - stap_start))
+        stap_stop = timeit.default_timer()
+        log.info("Process startup took %.2f seconds", stap_stop - stap_start)
         return True
 
     def normal_analysis(self):
         kwargs = {"args": self.args, "timeout": self.timeout, "run_as_root": self.run_as_root}
 
         # cmd = apicalls(self.target, **kwargs)
-        cmd = "%s %s" % (self.target, " ".join(kwargs["args"]))
-        stap_start = time.time()
-        self.proc = subprocess.Popen(cmd, env={"XAUTHORITY": "/root/.Xauthority", "DISPLAY": ":0"}, stderr=subprocess.PIPE, shell=True)
+        cmd = f"{self.target} {' '.join(kwargs['args'])}"
+        stap_start = timeit.default_timer()
+        self.proc = subprocess.Popen(
+            cmd, env={"XAUTHORITY": "/root/.Xauthority", "DISPLAY": ":0"}, stderr=subprocess.PIPE, shell=True
+        )
 
         log.debug(self.proc.stderr.readline())
 
-        stap_stop = time.time()
-        log.info("Process startup took %.2f seconds" % (stap_stop - stap_start))
+        stap_stop = timeit.default_timer()
+        log.info("Process startup took %.2f seconds", stap_stop - stap_start)
         return True
 
     @staticmethod
@@ -201,9 +204,9 @@ class Package(object):
         log.info("Package requested stop")
         try:
             r = self.proc.poll()
-            log.debug("stap subprocess retval %r", r)
+            log.debug("stap subprocess retval %d", r)
             self.proc.kill()
-            # subprocess.check_call(["sudo","kill", str(self.proc.pid)])
+            # subprocess.check_call(["sudo", "kill", str(self.proc.pid)])
             waitpid(self.proc.pid, 0)
             self._upload_file("stap.log", "logs/all.stap")
         except Exception as e:

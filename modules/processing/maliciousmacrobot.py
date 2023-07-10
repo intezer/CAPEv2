@@ -12,21 +12,21 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import absolute_import
-import os
 import logging
+import os
+
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.objects import File
-
-log = logging.getLogger(__name__)
 
 try:
     from mmbot import MaliciousMacroBot
 
     HAVE_MMBOT = True
-except:
+except Exception:
     HAVE_MMBOT = False
+
+log = logging.getLogger(__name__)
 
 
 class MMBot(Processing):
@@ -36,12 +36,12 @@ class MMBot(Processing):
 
     def run(self):
         self.key = "mmbot"
-        results = dict()
+        results = {}
         ftype = File(self.file_path).get_type()
 
         if self.task["category"] == "file":
             if not HAVE_MMBOT:
-                log.error("MaliciousMacroBot not installed, 'pip3 install mmbot', aborting mmbot analysis.")
+                log.error("MaliciousMacroBot not installed, 'pip3 install mmbot', aborting mmbot analysis")
                 return results
 
             package = ""
@@ -55,13 +55,16 @@ class MMBot(Processing):
             ):
                 return results
 
-            opts = dict()
-            opts["benign_path"] = self.options.get("benign_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "benign"))
-            opts["malicious_path"] = self.options.get("malicious_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "malicious"))
-            opts["model_path"] = self.options.get("model_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "model"))
+            opts = {
+                "benign_path": self.options.get("benign_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "benign")),
+                "malicious_path": self.options.get("malicious_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "malicious")),
+                "model_path": self.options.get("model_path", os.path.join(CUCKOO_ROOT, "data", "mmbot", "model")),
+            }
 
             try:
-                mmb = MaliciousMacroBot(opts["benign_path"], opts["malicious_path"], opts["model_path"], retain_sample_contents=False)
+                mmb = MaliciousMacroBot(
+                    opts["benign_path"], opts["malicious_path"], opts["model_path"], retain_sample_contents=False
+                )
 
                 mmb.mmb_init_model(modelRebuild=False)
                 predresult = mmb.mmb_predict(self.file_path)

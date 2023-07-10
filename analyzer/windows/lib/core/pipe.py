@@ -3,20 +3,33 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import errno
 import logging
 import socket
 import threading
-import errno
+from ctypes import addressof, byref, c_uint, create_string_buffer, sizeof
 
-from ctypes import create_string_buffer, c_uint, byref, sizeof, addressof
+from lib.common.defines import (
+    ADVAPI32,
+    ERROR_BROKEN_PIPE,
+    ERROR_MORE_DATA,
+    ERROR_PIPE_CONNECTED,
+    INVALID_HANDLE_VALUE,
+    KERNEL32,
+    PIPE_ACCESS_DUPLEX,
+    PIPE_ACCESS_INBOUND,
+    PIPE_READMODE_BYTE,
+    PIPE_READMODE_MESSAGE,
+    PIPE_TYPE_BYTE,
+    PIPE_TYPE_MESSAGE,
+    PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
+    SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR,
+)
 
-from lib.common.defines import KERNEL32, PIPE_ACCESS_INBOUND, ERROR_MORE_DATA
-from lib.common.defines import PIPE_TYPE_BYTE, PIPE_WAIT, ERROR_PIPE_CONNECTED
-from lib.common.defines import PIPE_UNLIMITED_INSTANCES, INVALID_HANDLE_VALUE
-from lib.common.defines import FILE_FLAG_WRITE_THROUGH, PIPE_READMODE_BYTE
-from lib.common.defines import ERROR_BROKEN_PIPE, PIPE_TYPE_MESSAGE
-from lib.common.defines import PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE
-from lib.common.defines import SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, ADVAPI32
+# from lib.common.defines import FILE_FLAG_WRITE_THROUGH
+
 log = logging.getLogger(__name__)
 
 BUFSIZE = 0x10000
@@ -48,12 +61,12 @@ class PipeForwarder(threading.Thread):
         success = KERNEL32.ReadFile(self.pipe_handle, byref(pid), sizeof(pid), byref(bytes_read), None)
 
         if not success or bytes_read.value != sizeof(pid):
-            log.warning("Unable to read the process identifier of this log pipe instance.")
+            log.warning("Unable to read the process identifier of this log pipe instance")
             KERNEL32.CloseHandle(self.pipe_handle)
             return
 
         if self.active.get(pid.value):
-            log.warning("A second log pipe handler for an active process is " "being requested, denying request.")
+            log.warning("A second log pipe handler for an active process is being requested, denying request")
             KERNEL32.CloseHandle(self.pipe_handle)
             return
 
@@ -70,8 +83,7 @@ class PipeForwarder(threading.Thread):
         open_handles.add(sock)
 
         while self.do_run:
-            success = KERNEL32.ReadFile(self.pipe_handle, byref(
-                buf), sizeof(buf), byref(bytes_read), None)
+            success = KERNEL32.ReadFile(self.pipe_handle, byref(buf), sizeof(buf), byref(bytes_read), None)
 
             if success or KERNEL32.GetLastError() == ERROR_MORE_DATA:
                 try:
@@ -89,8 +101,7 @@ class PipeForwarder(threading.Thread):
             elif KERNEL32.GetLastError() == ERROR_BROKEN_PIPE:
                 break
             else:
-                log.warning(
-                    "The log pipe handler has failed, last error %d.", KERNEL32.GetLastError())
+                log.warning("The log pipe handler has failed, last error %d", KERNEL32.GetLastError())
                 break
 
         if pid.value:
@@ -141,7 +152,7 @@ class PipeDispatcher(threading.Thread):
 
             KERNEL32.WriteFile(self.pipe_handle, response, len(response), byref(bytes_written), None)
 
-        KERNEL32.CloseHandle(self.pipe_handle)
+        KERNEL32.DisconnectNamedPipe(self.pipe_handle)
 
     def stop(self):
         self.do_run = False
@@ -195,7 +206,7 @@ class PipeServer(threading.Thread):
                 )
 
             if pipe_handle == INVALID_HANDLE_VALUE:
-                log.warning("Error opening logging pipe server.")
+                log.warning("Error opening logging pipe server")
                 continue
 
             if KERNEL32.ConnectNamedPipe(pipe_handle, None) or KERNEL32.GetLastError() == ERROR_PIPE_CONNECTED:
@@ -210,11 +221,10 @@ class PipeServer(threading.Thread):
         self.do_run = False
         for h in self.handlers:
             try:
-                if h.isAlive():
+                if h.is_alive():
                     h.stop()
             except Exception as e:
                 log.error(e, exc_info=True)
-                pass
 
 
 def disconnect_pipes():
@@ -222,5 +232,5 @@ def disconnect_pipes():
         try:
             sock.shutdown(socket.SHUT_RDWR)
             sock.close()
-        except:
+        except Exception:
             log.exception("Could not close socket")

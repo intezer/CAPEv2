@@ -11,30 +11,27 @@ Create Date: 2014-03-23 23:30:36.756792
 """
 
 # Revision identifiers, used by Alembic.
-from __future__ import absolute_import
-from __future__ import print_function
-
 revision = "263a45963c72"
 mongo_revision = "1"
 down_revision = None
 
 import os
 import sys
-import sqlalchemy as sa
-
 from datetime import datetime
+
+import sqlalchemy as sa
 
 try:
     from dateutil.parser import parse
 except ImportError:
     print("Unable to import dateutil.parser", end=" ")
-    print("(install with `pip3 install python-dateutil`)")
+    print("(install with `poetry run pip install python-dateutil`)")
     sys.exit()
 
 try:
     from alembic import op
 except ImportError:
-    print("Unable to import alembic (install with `pip3 install alembic`)")
+    print("Unable to import alembic (install with `poetry run pip install alembic`)")
     sys.exit()
 
 sys.path.append(os.path.join("..", ".."))
@@ -61,7 +58,9 @@ def upgrade():
 
         # Create table used by Tag.
         op.create_table(
-            "tags", sa.Column("id", sa.Integer(), primary_key=True), sa.Column("name", sa.String(length=255), nullable=False, unique=True),
+            "tags",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("name", sa.String(length=255), nullable=False, unique=True),
         )
 
         # Create secondary table used in association Machine - Tag.
@@ -75,7 +74,9 @@ def upgrade():
         op.add_column("machines", sa.Column("interface", sa.String(length=255), nullable=True))
         op.add_column("machines", sa.Column("snapshot", sa.String(length=255), nullable=True))
         # TODO: change default value, be aware sqlite doesn't support that kind of ALTER statement.
-        op.add_column("machines", sa.Column("resultserver_ip", sa.String(length=255), server_default="192.168.56.1", nullable=False))
+        op.add_column(
+            "machines", sa.Column("resultserver_ip", sa.String(length=255), server_default="192.168.56.1", nullable=False)
+        )
         # TODO: change default value, be aware sqlite doesn't support that kind of ALTER statement.
         op.add_column("machines", sa.Column("resultserver_port", sa.String(length=255), server_default="2042", nullable=False))
 
@@ -274,50 +275,13 @@ def upgrade():
 def mongo_upgrade():
     """Migrate mongodb schema and data."""
     # Read reporting.conf to fetch mongo configuration.
-    config = Config(cfg=os.path.join("..", "..", "conf", "reporting.conf"))
+    config = Config("reporting")
     # Run migration only if mongo is enabled as reporting module.
     if config.mongodb.enabled:
-        host = config.mongodb.get("host", "127.0.0.1")
-        port = config.mongodb.get("port", 27017)
-        database = config.mongodb.get("db", "cuckoo")
-        user = config.mongodb.get("user", None)
-        password = config.mongodb.get("password", None)
-        print("Mongo reporting is enabled, strarting mongo data migration.")
-
-        if not port.isnumber():
-            print("Port must be an integer")
-            sys.exit()
-
-        # Support old Mongo.
-        try:
-            from pymongo.connection import Connection
-            from pymongo.errors import ConnectionFailure
-
-            conn = Connection(host, port)
-            db = conn.cuckoo
-            done = True
-        except ImportError:
-            print("Unable to import pymongo (install with `pip3 install pymongo`)")
-            done = False
-        except ConnectionFailure:
-            print("Cannot connect to MongoDB")
-            sys.exit()
-
-        try:
-            if not done:
-                import pymongo
-
-                try:
-                    db = pymongo.MongoClient(host, port=port, username=user, password=password, authSource=database)[database]
-                except pymongo.errors.ConnectionFailure:
-                    print("Cannot connect to MongoDB")
-                    sys.exit()
-        except ImportError:
-            print("Unable to import pymongo (install with `pip3 install pymongo`)")
-            sys.exit()
+        from dev_utils.mongodb import mongo_collection_names
 
         # Check for schema version and create it.
-        if "cuckoo_schema" in db.collection_names():
+        if "cuckoo_schema" in mongo_collection_names:
             print("Mongo schema version not expected")
             sys.exit()
         else:

@@ -2,16 +2,17 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 # TODO
-#  https://github.com/cuckoosandbox/cuckoo/blob/ad5bf8939fb4b86d03c4d96014b174b8b56885e3/cuckoo/core/plugins.py#L29
+#  https://github.com/cuckoosandbox/cuckoo/blob/ad5bf8939fb4b86d03c4d96014b174b8b56885e3/cuckoo/core/plugins.py#L29
 
-from __future__ import absolute_import
+import hashlib
+import logging
 import os
-import sys
+import pkgutil
 import socket
 import struct
-import pkgutil
-import logging
-import hashlib
+import subprocess
+import sys
+import timeit
 import traceback
 import subprocess
 from ctypes import create_string_buffer, create_unicode_buffer, POINTER
@@ -19,7 +20,10 @@ from ctypes import c_wchar_p, byref, c_int, sizeof, cast, c_void_p, c_ulong
 
 from threading import Lock
 from datetime import datetime, timedelta
+from ctypes import POINTER, byref, c_int, c_ulong, c_void_p, cast, create_string_buffer, create_unicode_buffer, sizeof
+from pathlib import Path
 from shutil import copy
+from threading import Lock
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -31,21 +35,31 @@ from lib.common.defines import ADVAPI32, KERNEL32, NTDLL
 from lib.common.defines import ERROR_MORE_DATA, ERROR_PIPE_CONNECTED
 from lib.common.defines import SYSTEM_PROCESS_INFORMATION
 from lib.common.defines import EVENT_MODIFY_STATE, SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SYSTEMTIME
+from lib.common.abstracts import Auxiliary, Package
+from lib.common.constants import (
+    CAPEMON32_NAME,
+    CAPEMON64_NAME,
+    LOADER32_NAME,
+    LOADER64_NAME,
+    LOGSERVER_PREFIX,
+    PATHS,
+    PIPE,
+    SHUTDOWN_MUTEX,
+    TERMINATE_EVENT,
+)
+from lib.common.defines import ADVAPI32, EVENT_MODIFY_STATE, KERNEL32, NTDLL, SYSTEM_PROCESS_INFORMATION
 from lib.common.exceptions import CuckooError, CuckooPackageError
 from lib.common.hashing import hash_file
 from lib.common.results import upload_to_host
+from lib.core.compound import create_custom_folders
 from lib.core.config import Config
-from lib.core.pipe import PipeServer, PipeForwarder, PipeDispatcher
-from lib.core.pipe import disconnect_pipes
 from lib.core.packages import choose_package
+from lib.core.pipe import PipeDispatcher, PipeForwarder, PipeServer, disconnect_pipes
 from lib.core.privileges import grant_debug_privilege
-from lib.core.startup import create_folders, init_logging, disconnect_logger, set_clock
+from lib.core.startup import create_folders, disconnect_logger, init_logging, set_clock
 from modules import auxiliary
 
 log = logging.getLogger()
-
-INJECT_CREATEREMOTETHREAD = 0
-INJECT_QUEUEUSERAPC = 1
 
 BUFSIZE = 512
 FILES_LIST_LOCK = Lock()
@@ -101,7 +115,7 @@ def add_pid_to_aux_modules(pid):
     for aux in AUX_ENABLED:
         try:
             aux.add_pid(pid)
-        except:
+        except Exception:
             continue
 
 
@@ -109,7 +123,7 @@ def del_pid_from_aux_modules(pid):
     for aux in AUX_ENABLED:
         try:
             aux.del_pid(pid)
-        except:
+        except Exception:
             continue
 
 
@@ -123,12 +137,12 @@ def add_protected_path(name):
 
 def upload_files(folder):
     """Create a copy of the given file path."""
-    log_folder = PATHS["root"] + "\\" + folder
+    log_folder = f"{PATHS['root']}\\{folder}"
     try:
         if os.path.exists(log_folder):
-            log.info('Uploading files at path "%s" ', log_folder)
+            log.info('Uploading files at path "%s"', log_folder)
         else:
-            log.warning('Folder at path "%s" does not exist, skip.', log_folder)
+            log.warning('Folder at path "%s" does not exist, skipping', log_folder)
             return
     except IOError as e:
         log.warning('Unable to access folder at path "%s": %s', log_folder, e)
@@ -182,8 +196,8 @@ class Analyzer:
         """Return \\\\.\\PIPE on Windows XP and \\??\\PIPE elsewhere."""
         version = sys.getwindowsversion()
         if version.major == 5 and version.minor == 1:
-            return "\\\\.\\PIPE\\" + name
-        return "\\??\\PIPE\\" + name
+            return f"\\\\.\\PIPE\\{name}"
+        return f"\\??\\PIPE\\{name}"
 
     def pids_from_process_name_list(self, namelist):
         proclist = []
@@ -198,7 +212,7 @@ class Analyzer:
         while proc.NextEntryOffset:
             p.value += proc.NextEntryOffset
             proc = cast(p, POINTER(SYSTEM_PROCESS_INFORMATION)).contents
-            # proclist.append((proc.ImageName.Buffer[:proc.ImageName.Length/2], proc.UniqueProcessId))
+            # proclist.append((proc.ImageName.Buffer[:proc.ImageName.Length // 2], proc.UniqueProcessId))
             proclist.append((proc.ImageName.Buffer, proc.UniqueProcessId))
 
         for proc in proclist:
@@ -211,10 +225,8 @@ class Analyzer:
 
     def prepare(self):
         """Prepare env for analysis."""
-        global MONITOR_DLL
-        global MONITOR_DLL_64
+        global MONITOR_DLL, MONITOR_DLL_64, HIDE_PIDS
         # global SERVICES_PID
-        global HIDE_PIDS
 
         # Get SeDebugPrivilege for the Python process. It will be needed in
         # order to perform the injections.
@@ -224,8 +236,8 @@ class Analyzer:
         # Create the folders used for storing the results.
         create_folders()
 
-        add_protected_path(os.getcwd().encode("utf-8"))
-        add_protected_path(PATHS["root"].encode("utf-8"))
+        add_protected_path(Path.cwd().__bytes__())
+        add_protected_path(PATHS["root"].encode())
 
         # Initialize logging.
         init_logging()
@@ -233,6 +245,12 @@ class Analyzer:
         # Parse the analysis configuration file generated by the agent.
         self.config = Config(cfg="analysis.conf")
         self.options = self.config.get_options()
+
+        # Resolve the paths first in case some other part of the code needs those (fullpath) parameters.
+        if "curdir" in self.options:
+            self.options["curdir"] = os.path.expandvars(self.options["curdir"])
+        if "executiondir" in self.options:
+            self.options["executiondir"] = os.path.expandvars(self.options["executiondir"])
 
         # Set the default DLL to be used for this analysis.
         self.default_dll = self.options.get("dll")
@@ -308,65 +326,53 @@ class Analyzer:
 
         # Report missed injections
         for pid in INJECT_LIST:
-            log.warning("Monitor injection attempted but failed for process %d.", pid)
+            log.warning("Monitor injection attempted but failed for process %d", pid)
 
-        log.info("Analysis completed.")
+        log.info("Analysis completed")
 
     def get_completion_key(self):
-        if hasattr(self.config, "completion_key"):
-            return self.config.completion_key
-        else:
-            return ""
+        return getattr(self.config, "completion_key", "")
 
     def run(self):
         """Run analysis.
         @return: operation status.
         """
-        global MONITOR_DLL
-        global MONITOR_DLL_64
-        global LOADER32
-        global LOADER64
-        global ANALYSIS_TIMED_OUT
+        global MONITOR_DLL, MONITOR_DLL_64, LOADER32, LOADER64, ANALYSIS_TIMED_OUT
 
-        log.debug("Starting analyzer from: %s", os.getcwd())
+        log.debug("Starting analyzer from: %s", Path.cwd())
         log.debug("Storing results at: %s", PATHS["root"])
         log.debug("Pipe server name: %s", PIPE)
         log.debug("Python path: %s", os.path.dirname(sys.executable))
 
-        # If no analysis package was specified at submission, we try to select
-        # one automatically.
+        # If no analysis package was specified at submission, we try to select one automatically.
         if not self.config.package:
-            log.debug("No analysis package specified, trying to detect " "it automagically.")
+            log.debug("No analysis package specified, trying to detect it automagically")
 
-            # If the analysis target is a file, we choose the package according
-            # to the file format.
+            # If the analysis target is a file, we choose the package according to the file format.
             if self.config.category == "file":
                 package = choose_package(self.config.file_type, self.config.file_name, self.config.exports, self.target)
-            # If it's an URL, we'll just use the default Internet Explorer
-            # package.
+            # If it's an URL, we'll just use the default Internet Explorer package.
             else:
                 package = "ie"
 
-            # If we weren't able to automatically determine the proper package,
-            # we need to abort the analysis.
+            # If we weren't able to automatically determine the proper package, we need to abort the analysis.
             if not package:
-                raise CuckooError("No valid package available for file " "type: {0}".format(self.config.file_type))
+                raise CuckooError(f"No valid package available for file type: {self.config.file_type}")
 
             log.info('Automatically selected analysis package "%s"', package)
         # Otherwise just select the specified package.
         else:
             package = self.config.package
-            log.info('Analysis package "%s" has been specified.', package)
+            log.info('Analysis package "%s" has been specified', package)
         # Generate the package path.
-        package_name = "modules.packages.%s" % package
+        package_name = f"modules.packages.{package}"
         # Try to import the analysis package.
         try:
             log.debug('Importing analysis package "%s"...', package)
             __import__(package_name, globals(), locals(), ["dummy"])
-            # log.debug('Imported analysis package "%s".', package)
-        # If it fails, we need to abort the analysis.
-        except ImportError:
-            raise CuckooError('Unable to import package "{0}", does ' "not exist.".format(package_name))
+            # log.debug('Imported analysis package "%s"', package)
+        except ImportError as e:
+            raise CuckooError(f'Unable to import package "{package_name}", does not exist') from e
         except Exception as e:
             log.exception(e)
         # Initialize the package parent abstract.
@@ -375,45 +381,49 @@ class Analyzer:
         try:
             package_class = Package.__subclasses__()[0]
         except IndexError as e:
-            raise CuckooError("Unable to select package class " "(package={0}): {1}".format(package_name, e))
+            raise CuckooError(f"Unable to select package class (package={package_name}): {e}") from e
         except Exception as e:
             log.exception(e)
 
         # Initialize the analysis package.
         log.debug('Initializing analysis package "%s"...', package)
         self.package = package_class(self.options, self.config)
-        # log.debug('Initialized analysis package "%s".', package)
+        # log.debug('Initialized analysis package "%s"', package)
 
         # Move the sample to the current working directory as provided by the
         # task - one is able to override the starting path of the sample.
         # E.g., for some samples it might be useful to run from %APPDATA%
         # instead of %TEMP%.
         if self.config.category == "file":
+            # Try to create the folders for the cases of the custom paths other than %TEMP%
+            if "curdir" in self.options:
+                create_custom_folders(self.options["curdir"])
             self.target = self.package.move_curdir(self.target)
+        log.debug("New location of moved file: %s", self.target)
 
         # Set the DLL to that specified by package
-        if "dll" in self.package.options and self.package.options["dll"] is not None:
+        if self.package.options.get("dll") is not None:
             MONITOR_DLL = self.package.options["dll"]
             log.info("Analyzer: DLL set to %s from package %s", MONITOR_DLL, package_name)
         else:
             log.info("Analyzer: Package %s does not specify a DLL option", package_name)
 
         # Set the DLL_64 to that specified by package
-        if "dll_64" in self.package.options and self.package.options["dll_64"] is not None:
+        if self.package.options.get("dll_64") is not None:
             MONITOR_DLL_64 = self.package.options["dll_64"]
             log.info("Analyzer: DLL_64 set to %s from package %s", MONITOR_DLL_64, package_name)
         else:
             log.info("Analyzer: Package %s does not specify a DLL_64 option", package_name)
 
         # Set the loader to that specified by package
-        if "loader" in self.package.options and self.package.options["loader"] is not None:
+        if self.package.options.get("loader") is not None:
             LOADER32 = self.package.options["loader"]
             log.info("Analyzer: Loader set to %s from package %s", LOADER32, package_name)
         else:
             log.info("Analyzer: Package %s does not specify a loader option", package_name)
 
         # Set the loader_64 to that specified by package
-        if "loader_64" in self.package.options and self.package.options["loader_64"] is not None:
+        if self.package.options.get("loader_64") is not None:
             LOADER64 = self.package.options["loader_64"]
             log.info("Analyzer: Loader_64 set to %s from package %s", LOADER64, package_name)
         else:
@@ -439,10 +449,10 @@ class Analyzer:
 
         # Initialize Auxiliary modules
         Auxiliary()
-        prefix = auxiliary.__name__ + "."
+        prefix = f"{auxiliary.__name__}."
 
         # disable_screens = True
-        # if "disable_screens" in self.options and self.options["disable_screens"] == "0":
+        # if self.options.get("disable_screens") == "0":
         #    disable_screens = False
 
         for loader, name, ispkg in pkgutil.iter_modules(auxiliary.__path__, prefix):
@@ -452,25 +462,33 @@ class Analyzer:
             try:
                 log.debug('Importing auxiliary module "%s"...', name)
                 __import__(name, globals(), locals(), ["dummy"])
-                # log.debug('Imported auxiliary module "%s".', name)
+                # log.debug('Imported auxiliary module "%s"', name)
             except ImportError as e:
-                log.warning("Unable to import the auxiliary module " '"%s": %s', name, e)
+                log.warning('Unable to import the auxiliary module "%s": %s', name, e)
         # Walk through the available auxiliary modules.
         aux_avail = []
 
-        for module in Auxiliary.__subclasses__():
+        for module in sorted(Auxiliary.__subclasses__(), key=lambda x: x.start_priority, reverse=True):
             # Try to start the auxiliary module.
             # if module.__name__ == "Screenshots" and disable_screens:
             #    continue
             try:
-                log.debug('Initializing auxiliary module "%s"...', module.__name__)
                 aux = module(self.options, self.config)
-                # log.debug('Initialized auxiliary module "%s".', module.__name__)
+                log.debug('Initialized auxiliary module "%s"', module.__name__)
                 aux_avail.append(aux)
-                # log.debug('Trying to start auxiliary module "%s"...', module.__name__)
+
+                # The following commented out code causes the monitor to not upload logs.
+                # If the auxiliary module is not enabled, we shouldn't start it
+                # if hasattr(aux, "enabled") and not getattr(aux, "enabled", False):
+                #     log.debug('Auxiliary module "%s" is disabled.', module.__name__)
+                #     # We continue so that the module is not added to AUX_ENABLED
+                #     continue
+                # else:
+                log.debug('Trying to start auxiliary module "%s"...', module.__name__)
                 aux.start()
-            except (NotImplementedError, AttributeError):
-                log.warning("Auxiliary module %s was not implemented", module.__name__)
+                log.debug('Started auxiliary module "%s"', module.__name__)
+            except (NotImplementedError, AttributeError) as e:
+                log.warning("Auxiliary module %s was not implemented: %s", module.__name__, e)
             except Exception as e:
                 log.warning("Cannot execute auxiliary module %s: %s", module.__name__, e)
             else:
@@ -493,7 +511,7 @@ class Analyzer:
         zer0m0n.yarald("bin/rules.yarac")
 
         # Propagate the requested dump interval, if set.
-        zer0m0n.dumpint(int(self.options.get("dumpint", "0")))
+        zer0m0n.dumpint(int(self.options.get("dumpint", 0)))
         """
 
         si = subprocess.STARTUPINFO()
@@ -514,14 +532,12 @@ class Analyzer:
         # analysis package fails, we have to abort the analysis.
         try:
             pids = self.package.start(self.target)
-        except NotImplementedError:
-            raise CuckooError('The package "{0}" doesn\'t contain a start ' "function.".format(package_name))
+        except NotImplementedError as e:
+            raise CuckooError('The package "{package_name}" doesn\'t contain a start function') from e
         except CuckooPackageError as e:
-            raise CuckooError('The package "{0}" start function raised an ' "error: {1}".format(package_name, e))
+            raise CuckooError(f'The package "{package_name}" start function raised an error: {e}') from e
         except Exception as e:
-            raise CuckooError(
-                'The package "{0}" start function encountered ' "an unhandled exception: " "{1}".format(package_name,
-                                                                                                        e))
+            raise CuckooError(f'The package "{package_name}" start function encountered an unhandled exception: {e}') from e
 
         # If the analysis package returned a list of process IDs, we add them
         # to the list of monitored processes and enable the process monitor.
@@ -533,24 +549,24 @@ class Analyzer:
         # where the package isn't enabling any behavioral analysis), we don't
         # enable the process monitor.
         else:
-            log.info("No process IDs returned by the package, running for the full timeout.")
+            log.info("No process IDs returned by the package, running for the full timeout")
             pid_check = False
 
         # Check in the options if the user toggled the timeout enforce. If so,
         # we need to override pid_check and disable process monitor.
         if self.config.enforce_timeout:
-            log.info("Enabled timeout enforce, running for the full timeout.")
+            log.info("Enabled timeout enforce, running for the full timeout")
             pid_check = False
 
-        time_start = datetime.now()
+        time_start = timeit.default_timer()
         kernel_analysis = self.options.get("kernel_analysis", False)
 
         emptytime = None
 
         while self.do_run:
-            self.time_counter = datetime.now() - time_start
-            if self.time_counter.total_seconds() < 0 or self.time_counter.total_seconds() >= int(self.config.timeout):
-                log.info("Analysis timeout hit, terminating analysis.")
+            self.time_counter = timeit.default_timer() - time_start
+            if self.time_counter >= int(self.config.timeout):
+                log.info("Analysis timeout hit, terminating analysis")
                 ANALYSIS_TIMED_OUT = True
                 break
 
@@ -558,7 +574,7 @@ class Analyzer:
             # operating on the list of monitored processes. Therefore we
             # cannot proceed with the checks until the lock is released.
             if self.process_lock.locked():
-                log.info("we are locked")
+                log.info("Process lock is locked")
                 KERNEL32.Sleep(1000)
                 continue
 
@@ -577,7 +593,7 @@ class Analyzer:
                                     except Exception as e:
                                         log.error(e, exc_info=True)
                                 else:
-                                    log.info("procdump not enabled")
+                                    log.info("Procdump not enabled")
                                 log.info("Process with pid %s appears to have terminated", pid)
                                 if pid in self.process_list.pids:
                                     self.process_list.remove_pid(pid)
@@ -585,14 +601,13 @@ class Analyzer:
                         # If none of the monitored processes are still alive, we
                         # can terminate the analysis.
                         if not self.process_list.pids and (
-                                not self.LASTINJECT_TIME or (
-                                datetime.now() >= (self.LASTINJECT_TIME + timedelta(seconds=15)))
+                            not self.LASTINJECT_TIME or (timeit.default_timer() >= (self.LASTINJECT_TIME + 15))  # Add 15 seconds
                         ):
-                            if emptytime and (datetime.now() >= (emptytime + timedelta(seconds=5))):
-                                log.info("Process list is empty, terminating analysis.")
+                            if emptytime and (timeit.default_timer() >= (emptytime + 5)):  # Add 5 seconds
+                                log.info("Process list is empty, terminating analysis")
                                 break
                             elif not emptytime:
-                                emptytime = datetime.now()
+                                emptytime = timeit.default_timer()
                         else:
                             emptytime = None
 
@@ -607,14 +622,14 @@ class Analyzer:
                     # returns False, it means that it requested the analysis
                     # to be terminate.
                     if not self.package.check():
-                        log.info("The analysis package requested the " "termination of the analysis.")
+                        log.info("The analysis package requested the termination of the analysis")
                         break
 
                 # If the check() function of the package raised some exception
                 # we don't care, we can still proceed with the analysis but we
                 # throw a warning.
                 except Exception as e:
-                    log.warning('The package "%s" check function raised ' "an exception: %s", package_name, e)
+                    log.warning('The package "%s" check function raised an exception: %s', package_name, e)
             finally:
                 # Zzz.
                 KERNEL32.Sleep(1000)
@@ -626,62 +641,67 @@ class Analyzer:
                 if proc.is_alive():
                     try:
                         proc.set_terminate_event()
-                    except:
-                        log.error("Unable to set terminate event for process %d.", proc.pid)
+                    except Exception:
+                        log.error("Unable to set terminate event for process %d", proc.pid)
                         continue
-                    log.info("Terminate event set for process %d.", proc.pid)
-                if self.config.terminate_processes:
+                    log.info("Terminate event set for process %d", proc.pid)
+                if (
+                    self.config.terminate_processes
+                    and proc.is_alive()
+                    and pid not in self.CRITICAL_PROCESS_LIST
+                    and not proc.is_critical()
+                ):
                     # Try to terminate remaining active processes.
                     # (This setting may render full system memory dumps less useful!)
-                    if proc.is_alive() and not pid in self.CRITICAL_PROCESS_LIST and not proc.is_critical():
-                        log.info("Terminating process %d before shutdown.", proc.pid)
-                        proc_counter = 0
-                        while proc.is_alive():
-                            if proc_counter > 5:
-                                try:
-                                    proc.terminate()
-                                except:
-                                    continue
-                            log.info("Waiting for process %d to exit.", proc.pid)
-                            KERNEL32.Sleep(1000)
-                            proc_counter += 1
+                    log.info("Terminating process %d before shutdown", proc.pid)
+                    proc_counter = 0
+                    while proc.is_alive():
+                        if proc_counter > 5:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                continue
+                        log.info("Waiting for process %d to exit", proc.pid)
+                        KERNEL32.Sleep(1000)
+                        proc_counter += 1
 
         # Create the shutdown mutex.
         KERNEL32.CreateMutexA(None, False, SHUTDOWN_MUTEX)
-        log.info("Created shutdown mutex.")
+        log.info("Created shutdown mutex")
         # since the various processes poll for the existence of the mutex, sleep
         # for a second to ensure they see it before they're terminated
         KERNEL32.Sleep(1000)
 
-        log.info("Shutting down package.")
+        log.info("Shutting down package")
         try:
             # Before shutting down the analysis, the package can perform some
             # final operations through the finish() function.
             self.package.finish()
         except Exception as e:
-            log.warning('The package "%s" finish function raised an ' "exception: %s", package_name, e)
+            log.warning('The package "%s" finish function raised an exception: %s', package_name, e)
 
         try:
             # Upload files the package created to package_files in the
             # results folder.
-            for path, name in self.package.package_files() or []:
+            for path, name in self.package.package_files():
                 upload_to_host(path, os.path.join("package_files", name))
         except Exception as e:
-            log.warning('The package "%s" package_files function raised an ' "exception: %s", package_name, e)
+            log.warning('The package "%s" package_files function raised an exception: %s', package_name, e)
 
-        log.info("Stopping auxiliary modules.")
+        log.info("Stopping auxiliary modules")
         # Terminate the Auxiliary modules.
-        for aux in AUX_ENABLED:
+        for aux in sorted(AUX_ENABLED, key=lambda x: x.stop_priority, reverse=True):
             if not hasattr(aux, "stop"):
                 continue
             try:
+                log.info("Stopping auxiliary module: %s", aux.__class__.__name__)
                 aux.stop()
             except (NotImplementedError, AttributeError):
                 continue
             except Exception as e:
                 log.warning("Cannot terminate auxiliary module %s: %s", aux.__class__.__name__, e)
 
-        log.info("Finishing auxiliary modules.")
+        log.info("Finishing auxiliary modules")
         # Run the finish callback of every available Auxiliary module.
         for aux in aux_avail:
             try:
@@ -689,15 +709,14 @@ class Analyzer:
             except (NotImplementedError, AttributeError):
                 continue
             except Exception as e:
-                log.warning("Exception running finish callback of auxiliary " "module %s: %s", aux.__class__.__name__,
-                            e)
+                log.warning("Exception running finish callback of auxiliary module %s: %s", aux.__class__.__name__, e)
 
-        log.info("Shutting down pipe server and dumping dropped files.")
+        log.info("Shutting down pipe server and dumping dropped files")
 
         return True
 
 
-class Files(object):
+class Files:
     PROTECTED_NAMES = [
         "vmwareuser.exe",
         "vmwareservice.exe",
@@ -736,7 +755,8 @@ class Files(object):
 
         if pid not in self.files[filepath.lower()]:
             self.files[filepath.lower()].append(pid)
-            verbose and log.info("Added pid %s for %r", pid, filepath)
+            if verbose:
+                log.info("Added pid %s for %s", pid, filepath)
 
             # PROCESS_LIST.append(int(pid))
             add_pid_to_aux_modules(int(pid))
@@ -750,10 +770,10 @@ class Files(object):
 
         self.add_pid(filepath, pid, verbose=False)
 
-    def dump_file(self, filepath, metadata="", pids=False, ppids=False, category="files"):
+    def dump_file(self, filepath, metadata="", pids="", ppids="", category="files"):
         """Dump a file to the host."""
         if not os.path.isfile(filepath):
-            log.warning("File at path %r does not exist, skip.", filepath)
+            log.warning("File at path %s does not exist, skipping", filepath)
             return False
 
         duplicated = False
@@ -771,15 +791,14 @@ class Files(object):
             file_details = self.files_orig.get(filepath.lower())
             category = file_details["category"]
             metadata = file_details["metadata"]
-            path = self.files_orig.get(filepath.lower(), {}).get("path") or filepath
             pids = self.files.get(filepath.lower(), [])
-            filepath = self.files_orig.get(filepath.lower(), {}).get("path") or filepath
+            filepath = file_details.get("path", filepath)
 
         if category == "memory":
             if pids:
-                upload_path = os.path.join(category, "{}.dmp".format(pids[0]))
+                upload_path = os.path.join(category, f"{pids[0]}.dmp")
             else:
-                pids = [os.path.basename(filepath).split(".")[0]]
+                pids = [os.path.basename(filepath).split(".", 1)[0]]
                 upload_path = os.path.join(category, os.path.basename(filepath))
 
         else:
@@ -787,8 +806,7 @@ class Files(object):
 
         try:
             # If available use the original filepath, the one that is not lowercased.
-            upload_to_host(filepath, upload_path, pids, ppids, metadata=metadata, category=category,
-                           duplicated=duplicated)
+            upload_to_host(filepath, upload_path, pids, ppids, metadata=metadata, category=category, duplicated=duplicated)
             self.dumped.append(sha256)
         except (IOError, socket.error) as e:
             log.error('Unable to upload dropped file at path "%s": %s', filepath, e)
@@ -817,7 +835,7 @@ class Files(object):
             self.delete_file(list(self.files.keys())[0])
 
 
-class ProcessList(object):
+class ProcessList:
     def __init__(self):
         self.pids = []
         self.pids_notrack = []
@@ -827,26 +845,29 @@ class ProcessList(object):
         Track determines whether the analyzer should be monitoring this
         process, i.e., whether Cuckoo should wait for this process to finish.
         """
-        if int(pid) not in self.pids and int(pid) not in self.pids_notrack:
+        pid = int(pid)
+        if pid not in self.pids and pid not in self.pids_notrack:
             if track:
-                self.pids.append(int(pid))
+                self.pids.append(pid)
             else:
-                self.pids_notrack.append(int(pid))
+                self.pids_notrack.append(pid)
 
     def add_pids(self, pids):
         """Add one or more process identifiers to the process list."""
         if isinstance(pids, (tuple, list)):
             for pid in pids:
-                self.add_pid(pid)
+                if pid is not None:
+                    self.add_pid(pid)
         else:
             self.add_pid(pids)
 
     def has_pid(self, pid, notrack=True):
         """Return whether or not this process identifier being tracked."""
-        if int(pid) in self.pids:
+        pid = int(pid)
+        if pid in self.pids:
             return True
 
-        if notrack and int(pid) in self.pids_notrack:
+        if notrack and pid in self.pids_notrack:
             return True
 
         return False
@@ -860,7 +881,7 @@ class ProcessList(object):
             self.pids_notrack.remove(pid)
 
 
-class CommandPipeHandler(object):
+class CommandPipeHandler:
     """Pipe Handler.
     This class handles the notifications received through the Pipe Server and
     decides what to do with them.
@@ -875,15 +896,15 @@ class CommandPipeHandler(object):
     def _handle_debug(self, data):
         """Debug message from the monitor."""
         try:
-            log.debug(data.decode("utf-8"))
-        except:
+            log.debug(data.decode())
+        except Exception:
             log.debug(data)
 
     def _handle_info(self, data):
         """Regular message from the monitor."""
         try:
-            log.info(data.decode("utf-8"))
-        except:
+            log.info(data.decode())
+        except Exception:
             log.debug(data)
 
     def _handle_warning(self, data):
@@ -897,19 +918,18 @@ class CommandPipeHandler(object):
     def _handle_loaded(self, data):
         """The monitor has loaded into a particular process."""
         if not data:
-            log.warning("Received loaded command with incorrect parameters, " "skipping it.")
+            log.warning("Received loaded command with incorrect parameters, skipping it")
             return
 
         # pid, track = data.split(b",")
         # if not pid.isdigit() or not track.isdigit():
-        #    log.warning("Received loaded command with incorrect parameters, "
-        #                "skipping it.")
+        #    log.warning("Received loaded command with incorrect parameters, skipping it")
         #    return
 
         self.analyzer.process_lock.acquire()
         pid = int(data)
         if pid not in self.analyzer.process_list.pids:
-            self.analyzer.process_list.add_pid(int(pid))  # , track=int(track))
+            self.analyzer.process_list.add_pid(pid)  # , track=int(track))
         if pid in INJECT_LIST:
             INJECT_LIST.remove(pid)
         self.analyzer.process_lock.release()
@@ -949,7 +969,7 @@ class CommandPipeHandler(object):
         self.analyzer.process_lock.release()
 
     def _handle_kerror(self, error_msg):
-        log.error("Error : %s", str(error_msg))
+        log.error("Error : %s", error_msg)
 
     # if a new driver has been loaded, we stop the analysis
     def _handle_ksubvert(self, data):
@@ -962,44 +982,41 @@ class CommandPipeHandler(object):
             self.analyzer.MONITORED_DCOM = True
             dcom_pid = pid_from_service_name("DcomLaunch")
             if dcom_pid:
-                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid,
-                                   suspended=False)
+                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid)
                 self.analyzer.CRITICAL_PROCESS_LIST.append(int(dcom_pid))
                 filepath = servproc.get_filepath()
-                servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                self.analyzer.LASTINJECT_TIME = datetime.now()
+                servproc.inject(interest=filepath, nosleepskip=True)
+                self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                 servproc.close()
                 KERNEL32.Sleep(2000)
 
     def _handle_wmi(self, data):
-        if not self.analyzer.MONITORED_WMI and ANALYSIS_TIMED_OUT is False:
+        if not self.analyzer.MONITORED_WMI and not ANALYSIS_TIMED_OUT:
             self.analyzer.MONITORED_WMI = True
             if not self.analyzer.MONITORED_DCOM:
                 self.analyzer.MONITORED_DCOM = True
                 dcom_pid = pid_from_service_name("DcomLaunch")
                 if dcom_pid:
-                    servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid,
-                                       suspended=False)
+                    servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid)
                     self.analyzer.CRITICAL_PROCESS_LIST.append(int(dcom_pid))
                     filepath = servproc.get_filepath()
-                    servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                    self.analyzer.LASTINJECT_TIME = datetime.now()
+                    servproc.inject(interest=filepath, nosleepskip=True)
+                    self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                     servproc.close()
                     KERNEL32.Sleep(2000)
 
             wmi_pid = pid_from_service_name("winmgmt")
             if wmi_pid:
-                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=wmi_pid,
-                                   suspended=False)
+                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=wmi_pid)
                 self.analyzer.CRITICAL_PROCESS_LIST.append(int(wmi_pid))
                 filepath = servproc.get_filepath()
-                servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                self.analyzer.LASTINJECT_TIME = datetime.now()
+                servproc.inject(interest=filepath, nosleepskip=True)
+                self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                 servproc.close()
                 KERNEL32.Sleep(2000)
 
     def _handle_tasksched(self, data):
-        if not self.analyzer.MONITORED_TASKSCHED and ANALYSIS_TIMED_OUT is False:
+        if not self.analyzer.MONITORED_TASKSCHED and not ANALYSIS_TIMED_OUT:
             self.analyzer.MONITORED_TASKSCHED = True
             si = subprocess.STARTUPINFO()
             # STARTF_USESHOWWINDOW
@@ -1017,17 +1034,16 @@ class CommandPipeHandler(object):
 
             sched_pid = pid_from_service_name("schedule")
             if sched_pid:
-                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=sched_pid,
-                                   suspended=False)
+                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=sched_pid)
                 self.analyzer.CRITICAL_PROCESS_LIST.append(int(sched_pid))
                 filepath = servproc.get_filepath()
-                servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                self.analyzer.LASTINJECT_TIME = datetime.now()
+                servproc.inject(interest=filepath, nosleepskip=True)
+                self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                 servproc.close()
                 KERNEL32.Sleep(2000)
 
     def _handle_bits(self, data):
-        if not self.analyzer.MONITORED_BITS and ANALYSIS_TIMED_OUT is False:
+        if not self.analyzer.MONITORED_BITS and not ANALYSIS_TIMED_OUT:
             self.analyzer.MONITORED_BITS = True
             si = subprocess.STARTUPINFO()
             # STARTF_USESHOWWINDOW
@@ -1044,13 +1060,12 @@ class CommandPipeHandler(object):
                 self.analyzer.MONITORED_DCOM = True
                 dcom_pid = pid_from_service_name("DcomLaunch")
                 if dcom_pid:
-                    servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid,
-                                       suspended=False)
+                    servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=dcom_pid)
 
                     self.analyzer.CRITICAL_PROCESS_LIST.append(int(dcom_pid))
                     filepath = servproc.get_filepath()
-                    servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                    self.analyzer.LASTINJECT_TIME = datetime.now()
+                    servproc.inject(interest=filepath, nosleepskip=True)
+                    self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                     servproc.close()
                     KERNEL32.Sleep(2000)
 
@@ -1059,12 +1074,11 @@ class CommandPipeHandler(object):
             log.info("Started BITS Service")
             bits_pid = pid_from_service_name("BITS")
             if bits_pid:
-                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=bits_pid,
-                                   suspended=False)
+                servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=bits_pid)
                 self.analyzer.CRITICAL_PROCESS_LIST.append(int(bits_pid))
                 filepath = servproc.get_filepath()
-                servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                self.analyzer.LASTINJECT_TIME = datetime.now()
+                servproc.inject(interest=filepath, nosleepskip=True)
+                self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                 servproc.close()
                 KERNEL32.Sleep(2000)
 
@@ -1072,36 +1086,33 @@ class CommandPipeHandler(object):
     # Switch the service type to own process behind its back so we
     # can monitor the service more easily with less noise
     def _handle_service(self, servname):
-        if ANALYSIS_TIMED_OUT is False:
+        if not ANALYSIS_TIMED_OUT:
             si = subprocess.STARTUPINFO()
             # STARTF_USESHOWWINDOW
             si.dwFlags = 1
             # SW_HIDE
             si.wShowWindow = 0
-            subprocess.call("sc config " + servname.decode("utf-8") + " type= own", startupinfo=si)
+            subprocess.call(f"sc config {servname.decode()} type= own", startupinfo=si)
             log.info('Announced starting service "%s"', servname)
             if not self.analyzer.MONITORED_SERVICES:
                 # Inject into services.exe so we can monitor service creation
                 # if tasklist previously failed to get the services.exe PID we'll be
                 # unable to inject
                 if self.analyzer.SERVICES_PID:
-                    servproc = Process(
-                        options=self.analyzer.options, config=self.analyzer.config, pid=self.analyzer.SERVICES_PID,
-                        suspended=False
-                    )
+                    servproc = Process(options=self.analyzer.options, config=self.analyzer.config, pid=self.analyzer.SERVICES_PID)
                     self.analyzer.CRITICAL_PROCESS_LIST.append(int(self.analyzer.SERVICES_PID))
                     filepath = servproc.get_filepath()
-                    servproc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-                    self.analyzer.LASTINJECT_TIME = datetime.now()
+                    servproc.inject(interest=filepath, nosleepskip=True)
+                    self.analyzer.LASTINJECT_TIME = timeit.default_timer()
                     servproc.close()
                     KERNEL32.Sleep(1000)
                     self.analyzer.MONITORED_SERVICES = True
                 else:
-                    log.error("Unable to monitor service %s" % (servname))
+                    log.error("Unable to monitor service %s", servname)
 
     def _handle_resume(self, data):
         # RESUME:2560,3728'
-        self.analyzer.LASTINJECT_TIME = datetime.now()
+        self.analyzer.LASTINJECT_TIME = timeit.default_timer()
 
     # Handle attempted shutdowns/restarts -- flush logs for all monitored processes
     # additional handling can be added later
@@ -1114,9 +1125,6 @@ class CommandPipeHandler(object):
             if event_handle:
                 KERNEL32.SetEvent(event_handle)
                 KERNEL32.CloseHandle(event_handle)
-                if self.analyzer.options.get("procmemdump"):
-                    p = Process(pid=process_id)
-                    p.dump_memory()
                 self.files.dump_files()
         self.analyzer.process_lock.release()
 
@@ -1138,11 +1146,11 @@ class CommandPipeHandler(object):
         self.analyzer.process_lock.acquire()
 
         # Set the current DLL to the default one provided at submission.
-        dll = self.analyzer.default_dll
+        # dll = self.analyzer.default_dll
 
         if process_id in (self.analyzer.pid, self.analyzer.ppid):
             if process_id not in self.ignore_list["pid"]:
-                log.warning("Received request to inject Cuckoo processes, " "skipping it.")
+                log.warning("Received request to inject Cuckoo processes, skipping it")
                 self.ignore_list["pid"].append(process_id)
             self.analyzer.process_lock.release()
             return
@@ -1155,7 +1163,8 @@ class CommandPipeHandler(object):
             # list of tracked pids.
             if not self.analyzer.process_list.has_pid(process_id, notrack=False):
                 log.debug(
-                    "Received request to inject pid=%d. It was already " "on our notrack list, moving it to the track list.")
+                    "Received request to inject pid=%d. It was already on our notrack list, moving it to the track list", process_id
+                )
 
                 self.analyzer.process_list.remove_pid(process_id)
                 self.analyzer.process_list.add_pid(process_id)
@@ -1182,13 +1191,8 @@ class CommandPipeHandler(object):
             # release the lock. Let the injection do its thing.
             self.analyzer.process_lock.release()
 
-            # If we have both pid and tid, then we can use APC to inject.
-            if process_id and thread_id:
-                proc.inject(injectmode=INJECT_QUEUEUSERAPC, interest=filepath, nosleepskip=True)
-            else:
-                proc.inject(injectmode=INJECT_CREATEREMOTETHREAD, interest=filepath, nosleepskip=True)
-
-            log.info("Injected into process with pid %s and name %r", proc.pid, filename)
+            proc.inject(interest=filepath, nosleepskip=True)
+            log.info("Injected into process with pid %s and name %s", proc.pid, filename)
 
     def _handle_process(self, data):
         """Request for injection into a process."""
@@ -1204,13 +1208,10 @@ class CommandPipeHandler(object):
         elif data.count(b",") == 1:
             process_id, param = data.split(b",")
             thread_id = None
-            if process_id.isdigit():
-                process_id = int(process_id)
-            else:
-                process_id = None
+            process_id = int(process_id) if process_id.isdigit() else None
             if param.isdigit():
                 thread_id = int(param)
-        if process_id and ANALYSIS_TIMED_OUT is False:
+        if process_id and not ANALYSIS_TIMED_OUT:
             if process_id not in (self.analyzer.pid, self.analyzer.ppid):
                 # We inject the process only if it's not being
                 # monitored already, otherwise we would generate
@@ -1220,8 +1221,11 @@ class CommandPipeHandler(object):
                         INJECT_LIST.append(process_id)
                     # Open the process and inject the DLL.
                     proc = Process(
-                        options=self.analyzer.options, config=self.analyzer.config, pid=process_id, thread_id=thread_id,
-                        suspended=suspended
+                        options=self.analyzer.options,
+                        config=self.analyzer.config,
+                        pid=process_id,
+                        thread_id=thread_id,
+                        suspended=suspended,
                     )
                     filepath = proc.get_filepath()  # .encode('utf8', 'replace')
                     # if it's a URL analysis, provide the URL to all processes as
@@ -1239,25 +1243,24 @@ class CommandPipeHandler(object):
                              process_id)
                     # We want to prevent multiple injection attempts if one is already underway
                     if not in_protected_path(filename):
-                        _ = proc.inject(INJECT_QUEUEUSERAPC, interest)
-                        self.LASTINJECT_TIME = datetime.now()
+                        _ = proc.inject(interest)
+                        self.LASTINJECT_TIME = timeit.default_timer()
                         self.analyzer.NUM_INJECTED += 1
                     proc.close()
             else:
                 log.warning("Received request to inject process with pid %d, skipped", process_id)
         # return self._inject_process(int(data), None, 0)
-        return
 
     def _handle_process2(self, data):
         """Request for injection into a process using APC."""
         # Parse the process and thread identifier.
         if not data or data.count(b",") != 2:
-            log.warning("Received PROCESS2 command from monitor with an " "incorrect argument.")
+            log.warning("Received PROCESS2 command from monitor with an incorrect argument")
             return
 
         pid, tid, mode = data.split(b",")
         if not pid.isdigit() or not tid.isdigit() or not mode.isdigit():
-            log.warning("Received PROCESS2 command from monitor with an " "incorrect argument.")
+            log.warning("Received PROCESS2 command from monitor with an incorrect argument")
             return
 
         return self._inject_process(int(pid), int(tid), int(mode))
@@ -1265,15 +1268,20 @@ class CommandPipeHandler(object):
     def _handle_file_new(self, file_path):
         """Notification of a new dropped file."""
         if os.path.exists(file_path):
-            self.analyzer.files.add_file(file_path.decode("utf-8"), self.pid)
+            self.analyzer.files.add_file(file_path.decode(), self.pid)
 
     def _handle_file_cape(self, data):
         """Notification of a new dropped file."""
-        # Syntax -> PATH|PID|Metadata
+        # Syntax -> PATH|PID|PPID|Metadata
         file_path, pid, ppid, metadata = data.split(b"|")
         if os.path.exists(file_path):
-            self.analyzer.files.dump_file(file_path.decode("utf-8"), pids=[pid.decode("utf-8")],
-                                          ppids=[ppid.decode("utf-8")], metadata=metadata, category="CAPE")
+            self.analyzer.files.dump_file(
+                file_path.decode(),
+                pids=[pid.decode()],
+                ppids=[ppid.decode()],
+                metadata=metadata,
+                category="CAPE",
+            )
 
     # In case of FILE_DEL, the client is trying to notify an ongoing
     # deletion of an existing file, therefore we need to dump it
@@ -1281,7 +1289,7 @@ class CommandPipeHandler(object):
     def _handle_file_del(self, data):
         """Notification of a file being removed (if it exists) - we have to
         dump it before it's being removed."""
-        file_path = data.decode("utf8")
+        file_path = data.decode()
         if os.path.exists(file_path):
             self.analyzer.files.delete_file(file_path, self.pid)
 
@@ -1289,33 +1297,38 @@ class CommandPipeHandler(object):
         # We extract the file path.
         # We dump immediately.
         if b"\\CAPE\\" in file_path:
-            # Syntax -> PATH|PID|Metadata
+            # Syntax -> PATH|PID|PPID|Metadata
             file_path, pid, ppid, metadata = file_path.split(b"|")
             if os.path.exists(file_path):
-                self.analyzer.files.dump_file(file_path.decode("utf-8"), pids=[pid.decode("utf-8")],
-                                              ppids=[ppid.decode("utf-8")], metadata=metadata, category="procdump")
+                self.analyzer.files.dump_file(
+                    file_path.decode(),
+                    pids=[pid.decode()],
+                    ppids=[ppid.decode()],
+                    metadata=metadata,
+                    category="procdump",
+                )
 
         else:
             if os.path.exists(file_path):
                 if b"\\memory\\" in file_path:
-                    self.analyzer.files.dump_file(file_path.decode("utf-8"), category="memory")
+                    self.analyzer.files.dump_file(file_path.decode(), category="memory")
                 else:
-                    self.analyzer.files.add_file(file_path.decode("utf-8"), self.pid)
+                    self.analyzer.files.add_file(file_path.decode(), self.pid)
             else:
                 log.info("File doesn't exist, %s", file_path)
 
     def _handle_dumpreqs(self, data):
         if not data.isdigit():
-            log.warning("Received DUMPREQS command with an incorrect argument %r.", data)
+            log.warning("Received DUMPREQS command with an incorrect argument %s", data)
             return
         pid = int(data)
         if pid not in self.tracked:
-            log.warning("Received DUMPREQS command but there are no reqs for pid %d.", pid)
+            log.warning("Received DUMPREQS command but there are no reqs for pid %d", pid)
             return
 
         dumpreqs = self.tracked[pid].get("dumpreq", [])
         for addr, length in dumpreqs:
-            log.debug("tracked dump req (%r, %r, %r)", pid, addr, length)
+            log.debug("Tracked dump req (%d, %s, %s)", pid, addr, length)
 
             if not addr or not length:
                 continue
@@ -1334,17 +1347,17 @@ class CommandPipeHandler(object):
         """A file is being moved - track these changes."""
         # Syntax = "FILE_MOVE:old_file_path::new_file_path".
         if b"::" not in data:
-            log.warning("Received FILE_MOVE command from monitor with an incorrect argument.")
+            log.warning("Received FILE_MOVE command from monitor with an incorrect argument")
             return
 
         old_filepath, new_filepath = data.split(b"::", 1)
-        new_filepath = new_filepath.decode("utf8")
-        self.analyzer.files.move_file(old_filepath.decode("utf8"), new_filepath, self.pid)
+        new_filepath = new_filepath.decode()
+        self.analyzer.files.move_file(old_filepath.decode(), new_filepath, self.pid)
 
     def dispatch(self, data):
         response = "NOPE"
         if not data or b":" not in data:
-            log.critical("Unknown command received from the monitor: %r", data.strip())
+            log.critical("Unknown command received from the monitor: %s", data.strip())
         else:
             # Backwards compatibility (old syntax is, e.g., "FILE_NEW:" vs the
             # new syntax, e.g., "1234:FILE_NEW:").
@@ -1354,15 +1367,15 @@ class CommandPipeHandler(object):
             # if command not in (b"DEBUG", b"INFO"):
             #    log.info((command, arguments, "dispatch"))
             self.pid = None
-            fn = getattr(self, "_handle_%s" % command.lower().decode("utf-8"), None)
+            fn = getattr(self, f"_handle_{command.lower().decode()}", None)
             if not fn:
-                log.critical("Unknown command received from the monitor: %r", data.strip())
+                log.critical("Unknown command received from the monitor: %s", data.strip())
             else:
                 try:
                     response = fn(arguments)
                 except Exception as e:
                     log.error(e, exc_info=True)
-                    log.exception("Pipe command handler exception occurred (command " "%s args %r).", command,
+                    log.exception("Pipe command handler exception occurred (command %s args %s)", command,
                                   arguments)
 
         return response
@@ -1389,12 +1402,13 @@ if __name__ == "__main__":
 
     # When user set wrong package, Example: Emotet package when submit doc, package only is for EXE!
     except CuckooError as error:
-        log.info("You probably submitted the job with wrong package")
+        log.info("You probably submitted the job with wrong package", exc_info=True)
         log.error("Error raised = {}".format(error), exc_info=True)
         data["status"] = "exception"
         data["description"] = "You probably submitted the job with wrong package"
         try:
-            urlopen("http://127.0.0.1:8000/status", urlencode(data).encode("utf-8")).read()
+            with urlopen("http://127.0.0.1:8000/status", urlencode(data).encode()) as response:
+                response.read()
         except Exception as e:
             print(e)
         sys.exit()
@@ -1414,7 +1428,7 @@ if __name__ == "__main__":
         if len(log.handlers):
             log.exception(error_exc)
         else:
-            sys.stderr.write("{0}\n".format(error_exc))
+            sys.stderr.write(f"{error_exc}\n")
 
     # Once the analysis is completed or terminated for any reason, we report
     # back to the agent, notifying that it can report back to the host.
@@ -1422,14 +1436,15 @@ if __name__ == "__main__":
         try:
             # Let's invoke the completion procedure.
             analyzer.complete()
-        except Exception as e:
+        except Exception:
             complete_excp = traceback.format_exc()
             data["status"] = "exception"
             if "description" in data:
-                data["description"] += "%s\n%s" % (data["description"], complete_excp)
+                data["description"] += f"{data['description']}\n{complete_excp}"
             else:
                 data["description"] = complete_excp
         try:
-            urlopen("http://127.0.0.1:8000/status", urlencode(data).encode("utf-8")).read()
+            with urlopen("http://127.0.0.1:8000/status", urlencode(data).encode()) as response:
+                response.read()
         except Exception as e:
             print(e)

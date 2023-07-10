@@ -3,24 +3,28 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-import random
 import logging
-from threading import Thread
+import random
 import time
-import subprocess
-import os
-from Xlib.display import Display
-import pyautogui
+from threading import Thread
+
+try:
+    import pyautogui
+    from Xlib.display import Display
+
+    HAVE_GUI_LIBS = True
+except Exception:
+    HAVE_GUI_LIBS = False
 
 from lib.common.abstracts import Auxiliary
 
 log = logging.getLogger(__name__)
-logging.disable(level=logging.DEBUG)
 
-RESOLUTION = {"x": pyautogui.size()[0], "y": pyautogui.size()[1]}
+if HAVE_GUI_LIBS:
+    RESOLUTION = {"x": pyautogui.size()[0], "y": pyautogui.size()[1]}
 
-DELAY = 0.5
-pyautogui.PAUSE = 1
+    DELAY = 0.5
+    pyautogui.PAUSE = 1
 
 
 def move_mouse():
@@ -42,18 +46,18 @@ def click_mouse():
 def destroyOfficeWindows(window):
     try:
         children = window.query_tree().children
-    except:
+    except Exception:
         return
     for w in children:
-        if w.get_wm_class() in [
+        if w.get_wm_class() in (
             ("libreoffice", "libreoffice-writer"),
             # ('soffice.bin', 'soffice.bin'),
             ("libreoffice", "libreoffice-calc"),
             ("libreoffice", "libreoffice-draw"),
             ("libreoffice", "libreoffice-impress"),
             ("win", "Xpdf"),
-        ]:
-            log.debug("Destroying: %s" % w.get_wm_class()[1])
+        ):
+            log.debug("Destroying: %s", w.get_wm_class()[1])
             w.destroy()
         destroyOfficeWindows(w)
 
@@ -62,33 +66,38 @@ class Human(Thread, Auxiliary):
     """Simulate human."""
 
     def start(self):
-        log.info("Human started v0.02")
         self.do_run = False
 
-    def __init__(self, options={}, analyzer=None):
-        self.do_run = True
+    def __init__(self, options, config):
+        Auxiliary.__init__(self, options, config)
+        self.config = config
+        self.enabled = self.config.human_linux
+        self.do_run = self.enabled and HAVE_GUI_LIBS
 
         Thread.__init__(self)
-        Auxiliary.__init__(self, options, analyzer)
         self.initComplete = False
         self.thread = Thread(target=self.run)
         self.thread.start()
-        while self.initComplete == False:
+        while not self.initComplete:
             self.thread.join(0.5)
 
         log.debug("Human init complete")
 
     def stop(self):
-        """Stop Human."""
-        log.debug("Human requested stop")
+        if not self.enabled:
+            return False
+
         self.do_run = False
         self.thread.join()
-        log.debug("Human stopped")
 
     def run(self):
         """Run Human.
         @return: operation status.
         """
+        if not self.enabled:
+            self.initComplete = True
+            return False
+
         seconds = 0
         # Global disable flag.
         if "human" in self.options:

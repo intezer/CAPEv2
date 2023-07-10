@@ -2,21 +2,18 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-
 import logging
-import time
 import sys
+import time
+
+from lib.cuckoo.common.abstracts import Machinery
+from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.exceptions import CuckooCriticalError, CuckooMachineError
 
 try:
     from proxmoxer import ProxmoxAPI, ResourceException
 except ImportError:
-    sys.exit("Missed dependency: pip3 install proxmoxer -U")
-
-from lib.cuckoo.common.abstracts import Machinery
-from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.exceptions import CuckooCriticalError
-from lib.cuckoo.common.exceptions import CuckooMachineError
+    sys.exit("Install by yourself. Missed dependency: pip3 install proxmoxer -U")
 
 # silence overly verbose INFO level logging default of proxmoxer module
 logging.getLogger("proxmoxer").setLevel(logging.WARNING)
@@ -37,7 +34,9 @@ class Proxmox(Machinery):
         @raise CuckooCriticalError: if no credentials were provided
         """
         if not self.options.proxmox.username or not self.options.proxmox.password:
-            raise CuckooCriticalError("Proxmox credentials are missing, please add them to " "the Proxmox machinery configuration file.")
+            raise CuckooCriticalError(
+                "Proxmox credentials are missing, please add them to the Proxmox machinery configuration file"
+            )
         if not self.options.proxmox.hostname:
             raise CuckooCriticalError("Proxmox hostname not set")
 
@@ -51,21 +50,21 @@ class Proxmox(Machinery):
                       Proxmox.
         @raise CuckooMachineError: if the VM cannot be found."""
         proxmox = ProxmoxAPI(
-            self.options.proxmox.hostname, user=self.options.proxmox.username, password=self.options.proxmox.password, verify_ssl=False
+            self.options.proxmox.hostname,
+            user=self.options.proxmox.username,
+            password=self.options.proxmox.password,
+            verify_ssl=False,
         )
 
-        # /cluster/resources[type=vm] will give us all VMs no matter which node
-        # they reside on
+        # /cluster/resources[type=vm] will give us all VMs no matter which node they reside on
         try:
             vms = proxmox.cluster.resources.get(type="vm")
         except ResourceException as e:
-            raise CuckooMachineError("Error enumerating VMs: %s" % e)
+            raise CuckooMachineError(f"Error enumerating VMs: {e}")
 
         for vm in vms:
             if vm["name"] == label:
-                # dynamically address
-                # /nodes/<node>/{qemu,lxc,openvz,...}/<vmid> to get handle on
-                # VM
+                # dynamically address /nodes/<node>/{qemu,lxc,openvz,...}/<vmid> to get handle on VM
                 node = proxmox.nodes(vm["node"])
                 hv = node.__getattr__(vm["type"])
                 vm = hv.__getattr__(str(vm["vmid"]))
@@ -85,7 +84,7 @@ class Proxmox(Machinery):
             try:
                 task = node.tasks(taskid).status.get()
             except ResourceException as e:
-                raise CuckooMachineError("Error getting status of task " "%s: %s" % (taskid, e))
+                raise CuckooMachineError(f"Error getting status of task {taskid}: {e}")
 
             # extract operation name from task status for display
             operation = task["type"]
@@ -105,12 +104,12 @@ class Proxmox(Machinery):
             try:
                 status = vm.status.current.get()
             except ResourceException as e:
-                raise CuckooMachineError("Couldn't get status: %s" % e)
+                raise CuckooMachineError(f"Couldn't get status: {e}")
 
             if "lock" in status:
                 log.debug("%s: Task finished but VM still locked", label)
                 if status["lock"] != operation:
-                    log.warning("%s: Task finished but VM locked by different " "operation: %s", label, operation)
+                    log.warning("%s: Task finished but VM locked by different operation: %s", label, operation)
                 time.sleep(1)
                 elapsed += 1
                 continue
@@ -138,7 +137,7 @@ class Proxmox(Machinery):
         try:
             snapshots = vm.snapshot.get()
         except ResourceException as e:
-            raise CuckooMachineError("Error enumerating snapshots: %s" % e)
+            raise CuckooMachineError(f"Error enumerating snapshots: {e}")
 
         snaptime = 0
         snapshot = None
@@ -153,7 +152,7 @@ class Proxmox(Machinery):
 
         return snapshot
 
-    def rollback(self, label, vm, node):
+    def rollback(self, label, vm, node, retry=5, retry_index=0):
         """Roll back a VM's status to a statically configured or the most recent
         snapshot.
 
@@ -170,13 +169,22 @@ class Proxmox(Machinery):
             log.debug("%s: Reverting to snapshot %s", label, snapshot)
             taskid = vm.snapshot(snapshot).rollback.post()
         except ResourceException as e:
-            raise CuckooMachineError("Couldn't trigger rollback to " "snapshot %s: %s" % (snapshot, e))
+            raise CuckooMachineError(f"Couldn't trigger rollback to snapshot {snapshot}: {e}")
 
         task = self.wait_for_task(taskid, label, vm, node)
         if not task:
-            raise CuckooMachineError("Timeout expired while rolling back to " "snapshot %s" % snapshot)
+            raise CuckooMachineError(f"Timeout expired while rolling back to snapshot {snapshot}")
         if task["exitstatus"] != "OK":
-            raise CuckooMachineError("Rollback to snapshot %s failed: %s" % (snapshot, task["exitstatus"]))
+            if task["exitstatus"] == "timeout waiting on systemd":
+                if retry > retry_index:
+                    time.sleep(5)
+                    self.rollback(label, vm, node, retry, retry_index + 1)
+                else:
+                    raise CuckooMachineError(
+                        f"Rollback to snapshot {snapshot} failed: {task['exitstatus']} - Proxmox may be overwhelmed"
+                    )
+            else:
+                raise CuckooMachineError(f"Rollback to snapshot {snapshot} failed: {task['exitstatus']}")
 
     def start(self, label):
         """Roll back VM to known-pristine snapshot and optionally start it if
@@ -194,23 +202,23 @@ class Proxmox(Machinery):
         try:
             status = vm.status.current.get()
         except ResourceException as e:
-            raise CuckooMachineError("Couldn't get status: %s" % e)
+            raise CuckooMachineError(f"Couldn't get status: {e}")
 
         if status["status"] == "running":
-            log.debug("%s: Already running after rollback, no need to start " "it", label)
+            log.debug("%s: Already running after rollback, no need to start it", label)
             return
 
         try:
             log.debug("%s: Starting VM", label)
             taskid = vm.status.start.post()
         except ResourceException as e:
-            raise CuckooMachineError("Couldn't trigger start: %s" % e)
+            raise CuckooMachineError(f"Couldn't trigger start: {e}")
 
         task = self.wait_for_task(taskid, label, vm, node)
         if not task:
             raise CuckooMachineError("Timeout expired while starting")
         if task["exitstatus"] != "OK":
-            raise CuckooMachineError("Start failed: %s" % task["exitstatus"])
+            raise CuckooMachineError(f"Start failed: {task['exitstatus']}")
 
     def stop(self, label):
         """Do a hard shutdown of the VM.
@@ -225,10 +233,10 @@ class Proxmox(Machinery):
             log.debug("%s: Stopping VM", label)
             taskid = vm.status.stop.post()
         except ResourceException as e:
-            raise CuckooMachineError("Couldn't trigger stop: %s" % e)
+            raise CuckooMachineError(f"Couldn't trigger stop: {e}")
 
         task = self.wait_for_task(taskid, label, vm, node)
         if not task:
             raise CuckooMachineError("Timeout expired while stopping")
         if task["exitstatus"] != "OK":
-            raise CuckooMachineError("Stop failed: %s" % task["exitstatus"])
+            raise CuckooMachineError(f"Stop failed: {task['exitstatus']}")

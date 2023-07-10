@@ -2,9 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from random import randint
-
 from lib.common.abstracts import Package
 
 
@@ -19,5 +16,5 @@ class Generic(Package):
 
     def start(self, path):
         cmd_path = self.get_path("cmd.exe")
-        cmd_args = '/c start /wait "" "{0}"'.format(path)
+        cmd_args = f'/c start /wait "" "{path}"'
         return self.execute(cmd_path, cmd_args, path)

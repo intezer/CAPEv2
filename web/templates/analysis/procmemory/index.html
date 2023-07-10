@@ -1,26 +1,26 @@
-{% if analysis.procmemory %}
+{% if procmemory %}
     <div class="tabbable tabs">
         <ul class="nav nav-tabs" style="margin-bottom: 0;">
-            {% for proc in analysis.procmemory %}
+            {% for proc in procmemory %}
                 <li {%if forloop.first %}class="nav-item active"{% endif %}><a class="nav-link" href="#procmemory_{{proc.pid}}" data-toggle="tab">{{proc.pid}}</a></li>
             {% endfor %}
         </ul>
         <div class="tab-content">
-            {% for proc in analysis.procmemory %}
+            {% for proc in procmemory %}
                 {% if forloop.first %}
                 <div class="tab-pane fade show active" id="procmemory_{{proc.pid}}">
                 {% else %}
                 <div class="tab-pane fade" id="procmemory_{{proc.pid}}">
                 {% endif %}
-                    <h4>Full Dump Information</h4>
-                    <table class="table table-striped table-bordered table-dark table-sm table-hover" style="table-layout: fixed;">
+                    <center><h4>Full Dump Information</h4></center>
+                    <table class="table table-striped table-bordered table-dark table-sm table-hover" style="table-layout: fixed; width: 50%;margin-left: auto;margin-right: auto;">
                         <tr>
                             <th width="15%">Process Name</th>
                             <td>{{proc.name}}</td>
                         </tr>
                         <tr>
                             <th>Executable Path</th>
-                            <td>{{proc.path}}</td>
+                            <td>{{proc.proc_path}}</td>
                         </tr>
                         {% if proc.yara %}
                         <tr>
@@ -31,7 +31,6 @@
                                     {% if match.meta.author %}
                                         - Author: {{match.meta.author}}
                                     {% endif %}
-                                    <!--{% for string in match.strings %} <div>{{string}}</div> {% endfor %}-->
                                     </li>
                                 {% endfor %}
                             </td>
@@ -41,44 +40,44 @@
                         <tr>
                             <th>CAPE Yara</th>
                             <td>
-                                {% for match in proc.cape_yara %}
-                                <li>Match: {{match.name}} - {{match.meta.description}} - Author: {{match.meta.author}}
-                                    <!--
-                                    {% for key, value in match.memblocks.items %}
-                                        <div span style="padding-left: 16px;">'{{key}}' in address space {{value}}</div>
-                                    {% endfor %}
-                                    -->
+                            {% for match in proc.cape_yara %}
+                                <li>
+                                Match: {{match.name}}
+                                {% if match.meta.cape_type %} - {{match.meta.cape_type}}
+                                {% elif match.meta.description %} - {{match.meta.description}}
+                                {% endif %}
+                                {% if match.meta.author %} - Author: {{match.meta.author}}{% endif %}
                                 </li>
-                                {% endfor %}
+                            {% endfor %}
                             </td>
                         </tr>
                         {% endif %}
-                        {% if proc.file %}
+                        {% if proc.path %}
                             <tr>
                                 <th>Full Dump</th>
                                 <td>
-                                    <a class="btn btn-secondary btn-small" href="{% url "file" "memdump" analysis.info.id proc.pid %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a>
-                                    <a class="btn btn-secondary btn-small" href="{% url "file" "memdumpzip" analysis.info.id proc.pid %}" data-bs-toggle="tooltip" title="Download password-protected archive"><span class="fas fa-file-archive"></span> <span class="fas fa-download"></span></a>
+                                    <a class="btn btn-secondary btn-small" href="{% url "file" "memdump" id proc.pid %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a>
+                                    <a class="btn btn-secondary btn-small" href="{% url "file" "memdumpzip" id proc.pid %}" data-bs-toggle="tooltip" title="Download password-protected archive"><span class="fas fa-file-archive"></span> <span class="fas fa-download"></span></a>
                                 </td>
                             </tr>
                         {% endif %}
                         {% if proc.strings_path %}
                             <tr>
                                 <th>Process Strings</th>
-                                <td><a class="btn btn-secondary btn-small" href="{% url "file" "memdumpstrings" analysis.info.id proc.pid %}" data-bs-toggle="tooltip" title="Download strings"><span class="fas fa-download"></a></td>
+                                <td><a class="btn btn-secondary btn-small" href="{% url "file" "memdumpstrings" id proc.pid %}" data-bs-toggle="tooltip" title="Download strings"><span class="fas fa-download"></a></td>
                             </tr>
                         {% endif %}
                     </table>
                     {% if proc.address_space %}
-                    <h4>Address Space</h4>
-                    <table class="table table-striped table-bordered table-dark table-sm table-hover">
+                    <center><h4>Address Space</h4></center>
+                    <table class="table table-striped table-bordered table-dark table-sm table-hover" style="table-layout: fixed; width: 50%; text-align: center;margin-left: auto;margin-right: auto;">
                             <tr>
                                 <th width="15%">Start</th>
-                                <th>End</th>
-                                <th>Size</th>
-                                <th>Protection</th>
-                                <th>PE</th>
-                                <th>Download</th>
+                                <th width="15%">End</th>
+                                <th width="15%">Size</th>
+                                <th width="10%">Protection</th>
+                                <th width="10%">PE</th>
+                                <th width="15%">Download</th>
                             </tr>
                             {% for memmap in proc.address_space %}
                                 <tr>
@@ -95,8 +94,12 @@
                                     {% else %}
                                     <td><span class="badge badge-primary">No</span></td>
                                     {% endif %}
-                                    {% if proc.file %}
-                                    <td><a class="btn btn-secondary btn-small" href="{% url "procdump" analysis.info.id proc.pid memmap.start memmap.end %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a></td>
+                                    {% if proc.path %}
+                                    <td>
+                                        <a class="btn btn-secondary btn-small" href="{% url "procdump" id proc.pid memmap.start memmap.end %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a>
+                                        <a class="btn btn-secondary btn-small" href="{% url "procdump" id proc.pid  memmap.start memmap.end 1 %}" data-bs-toggle="tooltip" title="Download password-protected archive"><span class="fas fa-file-archive"></span> <span class="fas fa-download"></span></a>
+                                    </td>
+
                                     {% endif %}
                                 </tr>
                                 {% if memmap.chunks|length >= 2 %}
@@ -107,8 +110,11 @@
                                         <td>{{chunk.size}}</td>
                                         <td>{{chunk.prot}}</td>
                                         <td></td>
-                                        {% if proc.file %}
-                                        <td><a class="btn btn-secondary btn-small" href="{% url "procdump" analysis.info.id proc.pid chunk.start chunk.end %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a></td>
+                                        {% if proc.path %}
+                                        <td>
+                                            <a class="btn btn-secondary btn-small" href="{% url "procdump" id proc.pid chunk.start chunk.end %}" data-bs-toggle="tooltip" title="Download file"><span class="fas fa-download"></a>
+                                            <a class="btn btn-secondary btn-small" href="{% url "procdump" id proc.pid chunk.start chunk.end 1 %}" data-bs-toggle="tooltip" title="Download password-protected archive"><span class="fas fa-file-archive"></span> <span class="fas fa-download"></span></a>
+                                        </td>
                                         {% endif %}
                                     </tr>
                                 {% endfor %}
@@ -120,4 +126,6 @@
             {% endfor %}
         </div>
     </div>
+{% else %}
+    <div class="alert alert-secondary"><b>Sorry!</b> No process dumps.</div>
 {% endif %}

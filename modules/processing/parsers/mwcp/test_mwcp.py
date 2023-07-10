@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 from mwcp.parser import Parser
 
 
@@ -8,4 +7,3 @@ class MWCP_TEST(Parser):
 
     def run(self):
         pass
-

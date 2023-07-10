@@ -4,12 +4,12 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-import logging
-import json
-import os
 import argparse
-import urllib3
+import json
+import logging
+import os
 
+import urllib3
 from tcr_misc import get_sample
 
 urllib3.disable_warnings()
@@ -36,9 +36,8 @@ def get_filepaths(directory, args):
                 file_paths.append(filepath)  # Add it to the list.
 
     if args.family:
-        return filter(lambda path: args.family == os.path.dirname(path).split("/")[-1], file_paths)
-    else:
-        return file_paths  # Self-explanatory.
+        return filter(lambda path: args.family == os.path.dirname(path).rsplit("/", 1)[-1], file_paths)
+    return file_paths  # Self-explanatory.
 
 
 def load_sample_lists(args):
@@ -49,7 +48,10 @@ def load_sample_lists(args):
             sample_dict = json.load(samples)
             for hash_item in sample_dict["hashes"]:
                 sample_name = "malware." + hash_item["hash"] + "." + hash_item.get("name", "none") + ".exe"
-                get_sample(hash_item["hash"], os.path.dirname(sample_json_location) + "/" + sample_name)
+                try:
+                    get_sample(hash_item["hash"], os.path.dirname(sample_json_location) + "/" + sample_name)
+                except Exception as e:
+                    logging.exception(e)
 
 
 def run(args):

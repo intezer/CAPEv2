@@ -2,32 +2,32 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import sys
-import json
-import pkgutil
 import inspect
+import json
 import logging
-from datetime import datetime, timedelta
+import os
+import pkgutil
+import sys
+import timeit
 from collections import defaultdict
-from distutils.version import StrictVersion
+from contextlib import suppress
 
-from lib.cuckoo.common.abstracts import Auxiliary, Machinery, LibVirtMachinery, Processing
-from lib.cuckoo.common.abstracts import Report, Signature, Feed
-from lib.cuckoo.common.config import Config
+from packaging.version import Version
+
+from lib.cuckoo.common.abstracts import Auxiliary, Feed, LibVirtMachinery, Machinery, Processing, Report, Signature
+from lib.cuckoo.common.config import AnalysisConfig, Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
-from lib.cuckoo.common.exceptions import CuckooDisableModule
-from lib.cuckoo.common.exceptions import CuckooOperationalError
-from lib.cuckoo.common.exceptions import CuckooProcessingError
-from lib.cuckoo.common.exceptions import CuckooReportError
-from lib.cuckoo.common.exceptions import CuckooDependencyError
+from lib.cuckoo.common.exceptions import (
+    CuckooDependencyError,
+    CuckooDisableModule,
+    CuckooOperationalError,
+    CuckooProcessingError,
+    CuckooReportError,
+)
+from lib.cuckoo.common.mapTTPs import mapTTP
+from lib.cuckoo.common.path_utils import path_exists
+from lib.cuckoo.common.utils import add_family_detection
 from lib.cuckoo.core.database import Database
-
-try:
-    import re2 as re
-except ImportError:
-    import re
 
 log = logging.getLogger(__name__)
 db = Database()
@@ -41,11 +41,12 @@ config_mapper = {
     "reporting": reporting_cfg,
 }
 
+
 def import_plugin(name):
     try:
         module = __import__(name, globals(), locals(), ["dummy"])
     except (ImportError, SyntaxError) as e:
-        print('Unable to import plugin "{0}": {1}'.format(name, e))
+        print(f'Unable to import plugin "{name}": {e}')
         return
     else:
         # ToDo remove for release
@@ -56,14 +57,18 @@ def import_plugin(name):
 
 
 def import_package(package):
-    prefix = package.__name__ + "."
+    prefix = f"{package.__name__}."
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, prefix):
         if ispkg:
             continue
 
         # Disable initialization of disabled plugins, performance++
         _, category, module_name = name.split(".")
-        if category in config_mapper and module_name in config_mapper[category].fullconfig and config_mapper[category].get(module_name).get("enabled", False) is False:
+        if (
+            category in config_mapper
+            and module_name in config_mapper[category].fullconfig
+            and not config_mapper[category].get(module_name).get("enabled", False)
+        ):
             continue
 
         try:
@@ -98,126 +103,10 @@ def register_plugin(group, name):
 def list_plugins(group=None):
     if group:
         return _modules[group]
-    else:
-        return _modules
+    return _modules
 
 
-suricata_passlist = (
-    "agenttesla",
-    "medusahttp",
-    "vjworm",
-)
-
-suricata_blocklist = (
-    "abuse",
-    "agent",
-    "base64",
-    "common",
-    "custom",
-    "dropper",
-    "downloader",
-    "evil",
-    "executable",
-    "f-av",
-    "fake",
-    "fileless",
-    "filename",
-    "generic",
-    "fireeye",
-    "google",
-    "hacking",
-    "injector",
-    "known",
-    "likely",
-    "magic",
-    "malicious",
-    "media",
-    "msil",
-    "multi",
-    "observed",
-    "owned",
-    "perfect",
-    "possible",
-    "potential",
-    "powershell",
-    "probably",
-    "python",
-    "rogue",
-    "self-signed",
-    "shadowserver",
-    "single",
-    "suspect",
-    "suspected",
-    "supicious",
-    "targeted",
-    "team",
-    "terse",
-    "troj",
-    "trojan",
-    "unit42",
-    "unknown",
-    "user",
-    "vbinject",
-    "vbscript",
-    "virus",
-    "w2km",
-    "w97m",
-    "w32",
-    "win32",
-    "win64",
-    "windows",
-    "worm",
-    "wscript",
-    "http",
-    "ptsecurity",
-    "request",
-    "suspicious",
-)
-
-et_categories = ("ET TROJAN",
-                 "ETPRO TROJAN",
-                 "ET MALWARE",
-                 "ETPRO MALWARE",
-                 "ET CNC",
-                 "ETPRO CNC")
-
-def get_suricata_family(signature):
-    """
-    Args:
-        signature: suricata alert string
-    Return
-        family: family name or False
-    """
-    # ToDo Trojan-Proxy
-    family = False
-    words = re.findall(r"[A-Za-z0-9/\-]+", signature)
-    famcheck = words[2]
-    if "/" in famcheck:
-        famcheck_list = famcheck.split("/")  # [-1]
-        for fam_name in famcheck_list:
-            if not any([block in fam_name.lower() for block in suricata_blocklist]):
-                famcheck = fam_name
-                break
-    famchecklower = famcheck.lower()
-    if famchecklower.startswith("win.") and famchecklower.count(".") == 1:
-        famchecklower = famchecklower.split(".")[-1]
-        famcheck = famcheck.split(".")[-1]
-    if famchecklower in ("win32", "w32", "ransomware"):
-        famcheck = words[3]
-        famchecklower = famcheck.lower()
-    if famchecklower == "ptsecurity":
-        famcheck = words[3]
-        famchecklower = famcheck.lower()
-    isbad = any([block in famchecklower for block in suricata_blocklist])
-    if not isbad and len(famcheck) >= 4:
-        family = famcheck.title()
-    isgood = any([allow in famchecklower for allow in suricata_passlist])
-    if isgood and len(famcheck) >= 4:
-        family = famcheck.title()
-    return family
-
-
-class RunAuxiliary(object):
+class RunAuxiliary:
     """Auxiliary modules manager."""
 
     def __init__(self, task, machine):
@@ -232,8 +121,8 @@ class RunAuxiliary(object):
             for module in auxiliary_list:
                 try:
                     current = module()
-                except:
-                    log.exception("Failed to load the auxiliary module " '"{0}":'.format(module))
+                except Exception as e:
+                    log.exception('Failed to load the auxiliary module "%s": %s', module, e)
                     return
 
                 module_name = inspect.getmodule(current).__name__
@@ -243,7 +132,7 @@ class RunAuxiliary(object):
                 try:
                     options = self.cfg.get(module_name)
                 except CuckooOperationalError:
-                    log.debug("Auxiliary module %s not found in " "configuration file", module_name)
+                    log.debug("Auxiliary module %s not found in configuration file", module_name)
                     continue
 
                 if not options.enabled:
@@ -270,14 +159,17 @@ class RunAuxiliary(object):
         enabled = []
         for module in self.enabled:
             try:
-                getattr(module, "cb_%s" % name, default)(*args, **kwargs)
+                getattr(module, f"cb_{name}", default)(*args, **kwargs)
             except NotImplementedError:
                 pass
             except CuckooDisableModule:
                 continue
-            except:
+            except Exception:
                 log.exception(
-                    "Error performing callback %r on auxiliary module %r", name, module.__class__.__name__, extra={"task_id": self.task["id"]}
+                    "Error performing callback %s on auxiliary module %s",
+                    name,
+                    module.__class__.__name__,
+                    extra={"task_id": self.task["id"]},
                 )
 
             enabled.append(module)
@@ -290,12 +182,12 @@ class RunAuxiliary(object):
             except NotImplementedError:
                 pass
             except Exception as e:
-                log.warning("Unable to stop auxiliary module: %s", e)
+                log.warning("Unable to stop auxiliary module: %s", e, exc_info=True)
             else:
                 log.debug("Stopped auxiliary module: %s", module.__class__.__name__)
 
 
-class RunProcessing(object):
+class RunProcessing:
     """Analysis Results Processing Engine.
 
     This class handles the loading and execution of the processing modules.
@@ -307,7 +199,7 @@ class RunProcessing(object):
         """@param task: task dictionary of the analysis to process."""
         self.task = task
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
-        self.cfg = Config("processing")
+        self.cfg = processing_cfg
         self.cuckoo_cfg = Config()
         self.results = results
 
@@ -319,8 +211,8 @@ class RunProcessing(object):
         # Initialize the specified processing module.
         try:
             current = module(self.results)
-        except:
-            log.exception("Failed to load the processing module " '"{0}":'.format(module))
+        except Exception as e:
+            log.exception('Failed to load the processing module "%s": %s', module, e)
             return
 
         # Extract the module name.
@@ -348,12 +240,11 @@ class RunProcessing(object):
         try:
             # Run the processing module and retrieve the generated data to be
             # appended to the general results container.
-            log.debug('Executing processing module "%s" on analysis at ' '"%s"', current.__class__.__name__, self.analysis_path)
-            pretime = datetime.now()
+            log.debug('Executing processing module "%s" on analysis at "%s"', current.__class__.__name__, self.analysis_path)
+            pretime = timeit.default_timer()
             data = current.run()
-            posttime = datetime.now()
-            timediff = posttime - pretime
-            self.results["statistics"]["processing"].append({"name": current.__class__.__name__, "time": float("%d.%03d" % (timediff.seconds, timediff.microseconds / 1000))})
+            timediff = timeit.default_timer() - pretime
+            self.results["statistics"]["processing"].append({"name": current.__class__.__name__, "time": round(timediff, 3)})
 
             # If succeeded, return they module's key name and the data to be
             # appended to it.
@@ -361,9 +252,9 @@ class RunProcessing(object):
         except CuckooDependencyError as e:
             log.warning('The processing module "%s" has missing dependencies: %s', current.__class__.__name__, e)
         except CuckooProcessingError as e:
-            log.warning('The processing module "%s" returned the following ' "error: %s", current.__class__.__name__, e)
-        except:
-            log.exception('Failed to run the processing module "%s":', current.__class__.__name__)
+            log.warning('The processing module "%s" returned the following error: %s', current.__class__.__name__, e)
+        except Exception as e:
+            log.exception('Failed to run the processing module "%s": %s', current.__class__.__name__, e)
 
         return None
 
@@ -386,25 +277,24 @@ class RunProcessing(object):
             # Run every loaded processing module.
             for module in processing_list:
                 result = self.process(module)
-                # If it provided some results, append it to the big results
-                # container.
+                # If it provided some results, append it to the big results container.
                 if result:
                     self.results.update(result)
         else:
             log.info("No processing modules loaded")
 
-        self._detect_family()
-
         # Add temp_processing stats to global processing stats
         if self.results["temp_processing_stats"]:
             for plugin_name in self.results["temp_processing_stats"]:
-                self.results["statistics"]["processing"].append({"name": plugin_name, "time": self.results["temp_processing_stats"][plugin_name].get("time", 0)})
+                self.results["statistics"]["processing"].append(
+                    {"name": plugin_name, "time": self.results["temp_processing_stats"][plugin_name].get("time", 0)}
+                )
 
         del self.results["temp_processing_stats"]
 
         # For correct error log on webgui
         logs = os.path.join(self.analysis_path, "logs")
-        if os.path.exists(logs):
+        if path_exists(logs):
             for file_name in os.listdir(logs):
                 file_path = os.path.join(logs, file_name)
 
@@ -413,65 +303,85 @@ class RunProcessing(object):
                 # Skipping the current log file if it's too big.
                 if os.stat(file_path).st_size > self.cuckoo_cfg.processing.analysis_size_limit:
                     if not hasattr(self.results, "debug"):
-                        self.results.setdefault("debug", dict()).setdefault("errors", list())
-                    self.results["debug"]["errors"].append(
-                        "Behavioral log {0} too big to be processed, skipped. Increase analysis_size_limit in cuckoo.conf".format(file_name)
-                    )
+                        self.results.setdefault("debug", {}).setdefault("errors", []).append(
+                            f"Behavioral log {file_name} too big to be processed, skipped. Increase analysis_size_limit in cuckoo.conf"
+                        )
                     continue
         else:
             log.info("Logs folder doesn't exist, maybe something with with analyzer folder, any change?")
 
         return self.results
 
-    def _detect_family(self):
-        if not self.cfg.detections.enabled:
-            return
 
-        family = ""
-        malfamily_tag = ""
-
-        if self.cfg.detections.yara:
-            family = self.results.get("detections", "")
-            if family:
-                malfamily_tag = "Yara"
-
-        if self.cfg.detections.suricata and not family:
-            for alert in self.results.get("suricata", {}).get("alerts", []):
-                if alert.get("signature", "").startswith(et_categories):
-                    family = get_suricata_family(alert["signature"])
-                    if family:
-                        malfamily_tag = "Suricata"
-                        break
-
-        if self.results["info"]["category"] == "file":
-            if self.cfg.detections.virustotal and not family:
-                family = self.results.get("virustotal", {}).get("detection", "")
-                if family:
-                    malfamily_tag = "VirusTotal"
-
-            if self.cfg.detections.clamav and not family:
-                for detection in self.results.get("target", {}).get("file", {}).get("clamav", []):
-                    if detection.startswith("Win.Trojan."):
-                        words = re.findall(r"[A-Za-z0-9]+", detection)
-                        family = words[2]
-                        if family:
-                            malfamily_tag = "ClamAV"
-                            break
-
-        if family:
-            self.results["detections"] = family
-            self.results["malfamily_tag"] = malfamily_tag
-
-
-class RunSignatures(object):
+class RunSignatures:
     """Run Signatures."""
 
     def __init__(self, task, results):
         self.task = task
         self.results = results
-        self.ttps = list()
-        self.cfg_processing = Config("processing")
+        self.ttps = []
+        self.cfg_processing = processing_cfg
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
+
+        # Gather all enabled & up-to-date Signatures.
+        self.signatures = []
+        for signature in list_plugins(group="signatures"):
+            if self._should_load_signature(signature):
+                # Initialize them all
+                self.signatures.append(signature(self.results))
+
+        overlay = self._load_overlay()
+        log.debug("Applying signature overlays for signatures: %s", ", ".join(overlay))
+        for signature in self.signatures:
+            self._apply_overlay(signature, overlay)
+
+        self.evented_list = []
+        self.non_evented_list = []
+        try:
+            for sig in self.signatures:
+                if sig.evented:
+                    # This is to confirm that the evented signature has its own on_call function, which is required
+                    # https://capev2.readthedocs.io/en/latest/customization/signatures.html#evented-signatures
+                    if sig.on_call.__module__ != Signature.on_call.__module__:
+                        if (
+                            not sig.filter_analysistypes
+                            or self.results.get("target", {}).get("category") in sig.filter_analysistypes
+                        ):
+                            self.evented_list.append(sig)
+
+                if sig not in self.evented_list:
+                    self.non_evented_list.append(sig)
+        except Exception as e:
+            print(e)
+
+        # Cache of signatures to call per API name.
+        self.api_sigs = {}
+
+        # Prebuild a list of signatures that *may* be interested
+        self.call_always = set()
+        self.call_for_api = defaultdict(set)
+        self.call_for_cat = defaultdict(set)
+        self.call_for_processname = defaultdict(set)
+        for sig in self.evented_list:
+            if not sig.filter_apinames and not sig.filter_categories and not sig.filter_processnames:
+                self.call_always.add(sig)
+                continue
+            for api in sig.filter_apinames:
+                self.call_for_api[api].add(sig)
+            for cat in sig.filter_categories:
+                self.call_for_cat[cat].add(sig)
+            for proc in sig.filter_processnames:
+                self.call_for_processname[proc].add(sig)
+
+    def _should_load_signature(self, signature):
+        """Should the given signature be enabled for this analysis?"""
+        if not signature.enabled or signature.name is None:
+            return False
+
+        if not self._check_signature_version(signature):
+            return False
+
+        return True
 
     def _load_overlay(self):
         """Loads overlay data from a json file.
@@ -479,13 +389,10 @@ class RunSignatures(object):
         """
         filename = os.path.join(CUCKOO_ROOT, "data", "signature_overlay.json")
 
-        try:
+        with suppress(IOError):
             with open(filename) as fh:
                 odata = json.load(fh)
                 return odata
-        except IOError:
-            pass
-
         return {}
 
     def _apply_overlay(self, signature, overlay):
@@ -503,17 +410,16 @@ class RunSignatures(object):
         # Since signatures can hardcode some values or checks that might
         # become obsolete in future versions or that might already be obsolete,
         # I need to match its requirements with the running version of Cuckoo.
-        version = CUCKOO_VERSION.split("-")[0]
+        version = CUCKOO_VERSION.split("-", 1)[0]
+        sandbox_version = Version(version)
 
-        # If provided, check the minimum working Cuckoo version for this
-        # signature.
+        # If provided, check the minimum working Cuckoo version for this signature.
         if current.minimum:
             try:
-                # If the running Cuckoo is older than the required minimum
-                # version, skip this signature.
-                if StrictVersion(version) < StrictVersion(current.minimum.split("-")[0]):
+                # If the running Cuckoo is older than the required minimum version, skip this signature.
+                if sandbox_version < Version(current.minimum.split("-", 1)[0]):
                     log.debug(
-                        "You are running an older incompatible version " 'of Cuckoo, the signature "%s" requires ' "minimum version %s",
+                        'You are running an older incompatible version of Cuckoo, the signature "%s" requires minimum version %s',
                         current.name,
                         current.minimum,
                     )
@@ -522,15 +428,13 @@ class RunSignatures(object):
                 log.debug("Wrong minor version number in signature %s", current.name)
                 return None
 
-        # If provided, check the maximum working Cuckoo version for this
-        # signature.
+        # If provided, check the maximum working Cuckoo version for this  signature.
         if current.maximum:
             try:
-                # If the running Cuckoo is newer than the required maximum
-                # version, skip this signature.
-                if StrictVersion(version) > StrictVersion(current.maximum.split("-")[0]):
+                # If the running Cuckoo is newer than the required maximum version, skip this signature.
+                if sandbox_version > Version(current.maximum.split("-", 1)[0]):
                     log.debug(
-                        "You are running a newer incompatible version " 'of Cuckoo, the signature "%s" requires ' "maximum version %s",
+                        'You are running a newer incompatible version of Cuckoo, the signature "%s" requires maximum version %s',
                         current.name,
                         current.maximum,
                     )
@@ -550,43 +454,33 @@ class RunSignatures(object):
         if not self.results:
             return
 
-        # Initialize the current signature.
-        try:
-            current = signature(self.results)
-        except:
-            log.exception("Failed to load signature " '"{0}":'.format(signature))
-            return
-
-        # If the signature is disabled, skip it.
-        if not current.enabled or current.name == 'masslogger_files':
-            return None
-
-        if not self._check_signature_version(current):
-            return None
-
         # Give it path to the analysis results.
-        current.set_path(self.analysis_path)
-        log.debug('Running signature "%s"', current.name)
+        signature.set_path(self.analysis_path)
+        log.debug('Running signature "%s"', signature.name)
 
         try:
             # Run the signature and if it gets matched, extract key information
             # from it and append it to the results container.
-            pretime = datetime.now()
-            data = current.run()
-            posttime = datetime.now()
-            timediff = posttime - pretime
+            pretime = timeit.default_timer()
+            data = signature.run()
+            timediff = timeit.default_timer() - pretime
             self.results["statistics"]["signatures"].append(
-                {"name": current.name, "time": float("%d.%03d" % (timediff.seconds, timediff.microseconds / 1000)),}
+                {
+                    "name": signature.name,
+                    "time": round(timediff, 3),
+                }
             )
 
             if data:
-                log.debug('Analysis matched signature "%s"', current.name)
+                log.debug('Analysis matched signature "%s"', signature.name)
                 # Return information on the matched signature.
-                return current.as_result()
+                return signature.as_result()
+        except KeyError as e:
+            log.error('Failed to run signature "%s": %s', signature.name, e)
         except NotImplementedError:
             return None
-        except:
-            log.exception('Failed to run signature "%s":', current.name)
+        except Exception as e:
+            log.exception('Failed to run signature "%s": %s', signature.name, e)
 
         return None
 
@@ -595,102 +489,93 @@ class RunSignatures(object):
         test_signature: signature name, Ex: cape_detected_threat, to test unique signature
         """
 
+        if not self.cfg_processing.detections.behavior:
+            return
+
         # This will contain all the matched signatures.
         matched = []
         stats = {}
 
-        complete_list = list_plugins(group="signatures") or []
         if test_signature:
-            complete_list = [sig for sig in complete_list if sig.name == test_signature]
-        evented_list = list()
-        try:
-            evented_list = [
-                sig(self.results)
-                for sig in complete_list
-                if sig.enabled
-                and sig.evented
-                and self._check_signature_version(sig)
-                and (not sig.filter_analysistypes or self.results["target"]["category"] in sig.filter_analysistypes)
-            ]
-        except Exception as e:
-            print(e)
-        overlay = self._load_overlay()
-        log.debug("Applying signature overlays for signatures: %s", ", ".join(list(overlay.keys())))
-        for signature in complete_list + evented_list:
-            self._apply_overlay(signature, overlay)
+            self.evented_list = next((sig for sig in self.evented_list if sig.name == test_signature), [])
+            self.non_evented_list = next((sig for sig in self.non_evented_list if sig.name == test_signature), [])
+            if not isinstance(self.evented_list, list):
+                self.evented_list = [self.evented_list]
+            if not isinstance(self.non_evented_list, list):
+                self.non_evented_list = [self.non_evented_list]
 
-        if evented_list and "behavior" in self.results:
-            log.debug("Running %u evented signatures", len(evented_list))
-            for sig in evented_list:
-                stats[sig.name] = timedelta()
-                if sig == evented_list[-1]:
+        if self.evented_list and "behavior" in self.results:
+            log.debug("Running %d evented signatures", len(self.evented_list))
+            for sig in self.evented_list:
+                stats[sig.name] = 0
+                if sig == self.evented_list[-1]:
                     log.debug("\t `-- %s", sig.name)
                 else:
                     log.debug("\t |-- %s", sig.name)
 
             # Iterate calls and tell interested signatures about them.
             for proc in self.results["behavior"]["processes"]:
-                for call in proc["calls"]:
-                    # Loop through active evented signatures.
-                    for sig in evented_list:
-                        # Skip current call if it doesn't match the filters (if any).
-                        if sig.filter_processnames and not proc["process_name"] in sig.filter_processnames:
-                            continue
-                        if sig.filter_apinames and not call["api"] in sig.filter_apinames:
-                            continue
-                        if sig.filter_categories and not call["category"] in sig.filter_categories:
-                            continue
+                process_name = proc["process_name"]
+                process_id = proc["process_id"]
+                calls = proc.get("calls", [])
+                for idx, call in enumerate(calls):
+                    api = call.get("api")
+                    sigs = self.api_sigs.get(api)
+                    if sigs is None:
+                        # Build interested signatures
+                        cat = call.get("category")
+                        sigs = self.call_always.union(
+                            self.call_for_api.get(api, set()),
+                            self.call_for_cat.get(cat, set()),
+                            self.call_for_processname.get(process_name, set()),
+                        )
+                    for sig in sigs:
+                        # Setting signature attributes per call
+                        sig.cid = idx
+                        sig.call = call
+                        sig.pid = process_id
 
-                        result = None
+                        if sig.matched:
+                            continue
                         try:
-                            pretime = datetime.now()
+                            pretime = timeit.default_timer()
                             result = sig.on_call(call, proc)
-                            posttime = datetime.now()
-                            timediff = posttime - pretime
+                            timediff = timeit.default_timer() - pretime
+                            if sig.name not in stats:
+                                stats[sig.name] = 0
                             stats[sig.name] += timediff
                         except NotImplementedError:
                             result = False
                         except Exception as e:
-                            log.exception("Failed to run signature {}: {}".format(sig.name, e))
+                            log.exception("Failed to run signature %s: %s", sig.name, e)
                             result = False
 
-                        # If the signature returns None we can carry on, the
-                        # condition was not matched.
-                        if result is None:
-                            continue
-
-                        # On True, the signature is matched.
-                        if result is True:
-                            log.debug('Analysis matched signature "%s"', sig.name)
-                            matched.append(sig.as_result())
-                            if sig in complete_list:
-                                complete_list.remove(sig)
-
-                        # Either True or False, we don't need to check this sig anymore.
-                        evented_list.remove(sig)
-                        del sig
+                        if result:
+                            sig.matched = True
 
             # Call the stop method on all remaining instances.
-            for sig in evented_list:
+            for sig in self.evented_list:
+                if sig.matched:
+                    continue
                 try:
-                    pretime = datetime.now()
+                    pretime = timeit.default_timer()
                     result = sig.on_complete()
-                    posttime = datetime.now()
-                    timediff = posttime - pretime
+                    timediff = timeit.default_timer() - pretime
                     stats[sig.name] += timediff
                 except NotImplementedError:
                     continue
-                except:
-                    log.exception('Failed run on_complete() method for signature "%s":', sig.name)
+                except Exception as e:
+                    log.exception('Failed run on_complete() method for signature "%s": %s', sig.name, e)
                     continue
                 else:
-                    if result is True:
-                        if hasattr(sig, "ttp"):
-                            [self.ttps.append({"ttp": ttp, "signature": sig.name}) for ttp in sig.ttp]
-                        log.debug('Analysis matched signature "%s"', sig.name)
+                    if result and not sig.matched:
                         matched.append(sig.as_result())
-                        if sig in complete_list:
-                            complete_list.remove(sig)
+                        if hasattr(sig, "ttps"):
+                            [
+                                self.ttps.append({"ttp": ttp, "signature": sig.name})
+                                for ttp in sig.ttps
+                                if {"ttp": ttp, "signature": sig.name} not in self.ttps
+                            ]
 
         # Link this into the results already at this point, so non-evented signatures can use it
         self.results["signatures"] = matched
@@ -698,22 +583,38 @@ class RunSignatures(object):
         # Add in statistics for evented signatures that took at least some time
         for key, value in stats.items():
             if value:
-                self.results["statistics"]["signatures"].append(
-                    {"name": key, "time": float("%d.%03d" % (value.seconds, value.microseconds / 1000)),}
-                )
+                self.results["statistics"]["signatures"].append({"name": key, "time": round(timediff, 3)})
         # Compat loop for old-style (non evented) signatures.
-        if complete_list:
-            complete_list.sort(key=lambda sig: sig.order)
+        if self.non_evented_list:
+            if hasattr(self.non_evented_list, "sort"):
+                self.non_evented_list.sort(key=lambda sig: sig.order)
+            else:
+                # for testing single signature with process.py
+                self.non_evented_list = [self.non_evented_list]
             log.debug("Running non-evented signatures")
 
-            for signature in complete_list:
-                if not signature.filter_analysistypes or self.results["target"]["category"] in signature.filter_analysistypes:
+            for signature in self.non_evented_list:
+                if (
+                    not signature.filter_analysistypes
+                    or self.results.get("target", {}).get("category") in signature.filter_analysistypes
+                ):
                     match = self.process(signature)
                     # If the signature is matched, add it to the list.
-                    if match:
-                        if hasattr(signature, "ttp"):
-                            [self.ttps.append({"ttp": ttp, "signature": signature.name}) for ttp in signature.ttp]
-                        matched.append(match)
+                    if match and not signature.matched:
+                        if hasattr(signature, "ttps"):
+                            [
+                                self.ttps.append({"ttp": ttp, "signature": signature.name})
+                                for ttp in signature.ttps
+                                if {"ttp": ttp, "signature": signature.name} not in self.ttps
+                            ]
+                        signature.matched = True
+
+        for signature in self.signatures:
+            if not signature.matched:
+                continue
+            log.debug('Analysis matched signature "%s"', signature.name)
+            signature.matched = True
+            matched.append(signature.as_result())
 
         # Sort the matched signatures by their severity level.
         matched.sort(key=lambda key: key["severity"])
@@ -731,14 +632,17 @@ class RunSignatures(object):
             malscore = 0.0
 
         self.results["malscore"] = malscore
-        self.results["ttps"] = self.ttps
+        self.results["ttps"] = mapTTP(self.ttps)
 
         # Make a best effort detection of malware family name (can be updated later by re-processing the analysis)
-        if self.results.get("malfamily_tag", "") != "Yara" and self.cfg_processing.detections.enabled and self.cfg_processing.detections.behavior:
+        if (
+            self.results.get("malfamily_tag", "") != "Yara"
+            and self.cfg_processing.detections.enabled
+            and self.cfg_processing.detections.behavior
+        ):
             for match in matched:
-                if "families" in match and match["families"]:
-                    self.results["detections"] = match["families"][0]
-                    self.results["malfamily_tag"] = "Behavior"
+                if match.get("families"):
+                    add_family_detection(self.results, match["families"][0], "Behavior", "")
                     break
 
 
@@ -765,7 +669,7 @@ class RunReporting:
 
         self.results = results
         self.analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task["id"]))
-        self.cfg = Config("reporting")
+        self.cfg = reporting_cfg
         self.reprocess = reprocess
 
     def process(self, module):
@@ -776,14 +680,14 @@ class RunReporting:
         # Initialize current reporting module.
         try:
             current = module()
-        except:
-            log.exception('Failed to load the reporting module "{0}":'.format(module))
+        except Exception as e:
+            log.exception('Failed to load the reporting module "%s": %s', module, e)
             return
 
         # Extract the module name.
         module_name = inspect.getmodule(current).__name__
         if "." in module_name:
-            module_name = module_name.rsplit(".", 1)[1]
+            module_name = module_name.rsplit(".", 1)[-1]
 
         try:
             options = self.cfg.get(module_name)
@@ -802,31 +706,26 @@ class RunReporting:
         # Give it the the relevant reporting.conf section.
         current.set_options(options)
         # Load the content of the analysis.conf file.
-        current.cfg = Config(cfg=current.conf_path)
+        current.cfg = AnalysisConfig(current.conf_path)
 
         try:
             log.debug('Executing reporting module "%s"', current.__class__.__name__)
-            pretime = datetime.now()
-
-            if module_name == "submitCAPE" and self.reprocess:
-                tasks = db.list_parents(self.task["id"])
-                if tasks:
-                    self.results["CAPE_children"] = tasks
-                return
-            else:
-                current.run(self.results)
-            posttime = datetime.now()
-            timediff = posttime - pretime
+            pretime = timeit.default_timer()
+            current.run(self.results)
+            timediff = timeit.default_timer() - pretime
             self.results["statistics"]["reporting"].append(
-                {"name": current.__class__.__name__, "time": float("%d.%03d" % (timediff.seconds, timediff.microseconds / 1000)),}
+                {
+                    "name": current.__class__.__name__,
+                    "time": round(timediff, 3),
+                }
             )
 
         except CuckooDependencyError as e:
             log.warning('The reporting module "%s" has missing dependencies: %s', current.__class__.__name__, e)
         except CuckooReportError as e:
             log.warning('The reporting module "%s" returned the following error: %s', current.__class__.__name__, e)
-        except:
-            log.exception('Failed to run the reporting module "%s":', current.__class__.__name__)
+        except Exception as e:
+            log.exception('Failed to run the reporting module "%s": %s', current.__class__.__name__, e)
 
     def run(self):
         """Generates all reports.
@@ -850,7 +749,7 @@ class RunReporting:
             log.info("No reporting modules loaded")
 
 
-class GetFeeds(object):
+class GetFeeds:
     """Feed Download and Parsing Engine
 
     This class handles the downloading and modification of feed modules.
@@ -859,7 +758,7 @@ class GetFeeds(object):
 
     def __init__(self, results):
         self.results = results
-        self.results["feeds"] = dict()
+        self.results["feeds"] = {}
 
     def process(self, feed):
         """Process modules with either downloaded data directly, or by
@@ -869,19 +768,19 @@ class GetFeeds(object):
 
         try:
             current = feed()
-            log.debug('Loading feed "{0}"'.format(current.name))
-        except:
-            log.exception('Failed to load feed "{0}":'.format(current.name))
+            log.debug('Loading feed "%s"', current.name)
+        except Exception as e:
+            log.exception('Failed to load feed "%s": %s', current.name, e)
             return
 
         if current.update():
             try:
                 current.modify()
                 current.run(modified=True)
-                log.debug('"{0}" has been updated'.format(current.name))
+                log.debug('"%s" has been updated', current.name)
             except NotImplementedError:
                 current.run(modified=False)
-            except:
+            except Exception:
                 log.exception('Failed to run feed "%s"', current.name)
                 return
 
@@ -898,4 +797,4 @@ class GetFeeds(object):
                 # If the feed is disabled, skip it.
                 if feed.enabled:
                     log.debug('Running feed module "%s"', feed.name)
-                    runit = self.process(feed)
+                    self.process(feed)

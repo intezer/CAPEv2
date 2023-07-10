@@ -3,12 +3,10 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import libvirt
 
 from lib.cuckoo.common.abstracts import LibVirtMachinery
-from lib.cuckoo.common.exceptions import CuckooCriticalError
-from lib.cuckoo.common.exceptions import CuckooMachineError
+from lib.cuckoo.common.exceptions import CuckooCriticalError, CuckooMachineError
 
 
 class ESX(LibVirtMachinery):
@@ -44,7 +42,7 @@ class ESX(LibVirtMachinery):
         """
         return the already-connected single connection handle if set, otherwise set it.
         """
-        if self.global_conn == None:
+        if self.global_conn is None:
             self.global_conn = self._global_connect()
         return self.global_conn
 
@@ -56,7 +54,7 @@ class ESX(LibVirtMachinery):
             self.auth = [[libvirt.VIR_CRED_AUTHNAME, libvirt.VIR_CRED_NOECHOPROMPT], self._auth_callback, None]
             return libvirt.openAuth(self.dsn, self.auth, 0)
         except libvirt.libvirtError as libvex:
-            raise CuckooCriticalError("libvirt returned an exception on connection: %s" % libvex)
+            raise CuckooCriticalError(f"libvirt returned an exception on connection: {libvex}")
 
     def _disconnect(self, conn):
         """

@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 from lib.common.abstracts import Package
 
 
@@ -15,4 +14,4 @@ class CPL(Package):
 
     def start(self, path):
         control = self.get_path("control.exe")
-        return self.execute(control, '"%s"' % path, path)
+        return self.execute(control, f'"{path}"', path)

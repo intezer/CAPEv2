@@ -12,11 +12,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import absolute_import
-import os
 import logging
-import subprocess
 import socket
+import subprocess
 
 try:
     import re2 as re
@@ -30,20 +28,16 @@ class Utils:
     """Various Utilities"""
 
     def is_valid_ipv4(self, ip):
-        if ip:
-            if re.match("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip) == None:
-                return False
-            else:
-                try:
-                    socket.inet_aton(ip)
-                    return True
-                except socket.error:
-                    return False
-        else:
+        if ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip) is None:
+            return False
+        try:
+            socket.inet_aton(ip)
+            return True
+        except socket.error:
             return False
 
     def cmd_wrapper(self, cmd):
-        # print("running command and waiting for it to finish %s" % (cmd))
+        # print(f"Running command and waiting for it to finish {cmd}")
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         stdout, stderr = p.communicate()
-        return (p.returncode, stdout, stderr)
+        return p.returncode, stdout, stderr

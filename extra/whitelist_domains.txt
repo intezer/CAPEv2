@@ -11,6 +11,7 @@ client-office365-tas\.msedge\.net$
 api\.onedrive\.com$
 \.live\.com$
 \.bing.com$
+\.res\.office365\.com$
 
 # Microsoft
 watson\.telemetry\.microsoft\.com$
@@ -28,6 +29,7 @@ download\.windowsupdate\.com$
 \.blob\.core\.windows\.net$
 crl\.microsoft\.com
 .*\.phicdn.net$
+crl\.microsoft\.com$
 
 \.windows\.com\.akadns\.net$
 \.microsoft\.com\.nsatc\.net$
@@ -36,9 +38,57 @@ kms8\.msguides\.com
 outlook\.office365\.com
 s8\.uk\.to
 
+-microsoft-com\.akamaized\.net$
+msn-com\.akamaized\.net$
+\.s-microsoft\.com$
+\.microsoft.net$
+\.msedge\.net$
+\.licdn\.com$
+\.xboxlive\.com$
+\.xboxservices\.com$
+\.onestore\.ms$
+\.passport\.net$
+\.virtualearth\.net$
+
+
+# Edge
+fp-vp-nocache\.azureedge\.net$
+\.clo.footprintdns\.com$
+edgeassetservice\.azureedge\.net$
+\.nelreports.net$
+
+# Edge analytics
+\.scorecardresearch\.com$
+
+# Edge Developer Tools analytics
+devtools\.azureedge\.net$
+cm\.mgid\.com$
+code\.yengo\.com$
+trace\.mediago\.io$
+trace\.popin\.cc$
+
+# Cloudflare Network Error Logging (NEL)
+\.nel\.cloudflare.com$
+
+# Cloudflare browser verification
+challenges\.cloudflare\.com$
+
+\.local$
+\.arpa$
+
 # Google
 update\.googleapis\.com$
 pki-goog\.l\.google\.com
+_googlecast\._tcp\.local$
+chrome\.cloudflare-dns\.com$
+
+# Firefox
+\.firefox.com$
+\.mozaws.net$
+\.mozgcp.net$
+\.mozilla.net$
+\.getpocket.com$
+mozilla.cloudflare-dns.com
 
 # https://github.com/threatstop/crl-ocsp-whitelist
 aces\.ocsp\.identrust\.com
@@ -100,6 +150,7 @@ ocsp09\.actalis\.it
 ocsp1\.hongkongpost\.gov\.hk
 ocsp1\.netlock\.hu
 ocsp1\.trustisfps\.com
+ocsp\.globalsign\.com
 ocsp2\.globalsign\.com
 ocsp2\.netlock\.hu
 ocsp2\.wisekey\.com

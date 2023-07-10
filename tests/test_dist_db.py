@@ -2,9 +2,8 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from lib.cuckoo.common.dist_db import Node, StringList, Machine, Task, create_session
-from sqlalchemy import Table
+
+from lib.cuckoo.common.dist_db import Machine, Node, StringList, Task
 
 
 def test_node():

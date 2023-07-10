@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import xml.etree.ElementTree as ET
 
 from lib.cuckoo.common.abstracts import LibVirtMachinery
@@ -18,7 +17,7 @@ class KVM(LibVirtMachinery):
         xml = ET.fromstring(self._lookup(label).XMLDesc())
         elem = xml.find("./devices/interface[@type='network']")
         if elem is None:
-            return elem
+            return None
         elem = elem.find("target")
         if elem is None:
             return None
@@ -29,11 +28,8 @@ class KVM(LibVirtMachinery):
         super(KVM, self).start(label)
         machine = self.db.view_machine_by_label(label)
         if machine:
-            if hasattr(machine, "interface"):
-                iface = machine.interface
-            else:
-                iface = self._get_interface(label)
+            iface = getattr(machine, "interface", self._get_interface(label))
             if iface:
                 self.db.set_machine_interface(label, iface)
             else:
-                print("Can't get iface for {}".format(label))
+                print(f"Can't get iface for {label}")
