@@ -9,6 +9,7 @@
     "backdoor_ketrican_regkeys.py": {},
     "recon_fingerprint.py": {},
     "dead_connect.py": {},
-    "infostealer_mail.py": {}
+    "infostealer_mail.py": {},
+    "stealth_file.py": {}
   }
 }
