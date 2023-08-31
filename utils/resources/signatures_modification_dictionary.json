@@ -8,6 +8,7 @@
     "infostealer_cookies.py": {},
     "backdoor_ketrican_regkeys.py": {},
     "recon_fingerprint.py": {},
-    "dead_connect.py": {}
+    "dead_connect.py": {},
+    "infostealer_mail.py": {}
   }
 }
