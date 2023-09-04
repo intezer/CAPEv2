@@ -12,6 +12,7 @@
     "infostealer_mail.py": {},
     "stealth_file.py": {},
     "credential_dumping.py": {},
-    "antivm_generic_disk.py": {}
+    "antivm_generic_disk.py": {},
+    "stack_pivot.py": {}
   }
 }
