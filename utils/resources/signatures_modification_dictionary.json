@@ -14,6 +14,7 @@
     "credential_dumping.py": {},
     "antivm_generic_disk.py": {},
     "stack_pivot.py": {},
-    "multiple_ua.py": {}
+    "multiple_ua.py": {},
+    "antisandbox_unhook.py": {}
   }
 }
