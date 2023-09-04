@@ -10,6 +10,7 @@
     "recon_fingerprint.py": {},
     "dead_connect.py": {},
     "infostealer_mail.py": {},
-    "stealth_file.py": {}
+    "stealth_file.py": {},
+    "credential_dumping.py": {}
   }
 }
