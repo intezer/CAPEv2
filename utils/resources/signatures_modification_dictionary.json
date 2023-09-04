@@ -11,6 +11,7 @@
     "dead_connect.py": {},
     "infostealer_mail.py": {},
     "stealth_file.py": {},
-    "credential_dumping.py": {}
+    "credential_dumping.py": {},
+    "antivm_generic_disk.py": {}
   }
 }
