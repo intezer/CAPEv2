@@ -18,6 +18,8 @@ PASSWD="SuperPuperSecret"
 # Only in case if you using distributed CAPE And MongoDB sharding.
 DIST_MASTER_IP="192.168.1.1"
 USER="cape"
+# The postgres db you want to use, default is the same as the user name
+POSTGRES_DB=$USER
 nginx_version=1.19.6
 prometheus_version=2.20.1
 grafana_version=7.1.5
@@ -608,9 +610,9 @@ function distributed() {
     sudo cp /opt/CAPEv2/uwsgi/capedist.ini /etc/uwsgi/apps-available/cape_dist.ini
     sudo ln -s /etc/uwsgi/apps-available/cape_dist.ini /etc/uwsgi/apps-enabled
 
-    sudo -u postgres -H sh -c "psql -c \"CREATE DATABASE ${USER}dist\"";
-    sudo -u postgres -H sh -c "psql -d \"${USER}\" -c \"GRANT ALL PRIVILEGES ON DATABASE ${USER}dist to ${USER};\""
-    sudo -u postgres -H sh -c "psql -d \"${USER}\" -c \"ALTER DATABASE ${USER}dist OWNER TO ${USER};\""
+    sudo -u postgres -H sh -c "psql -c \"CREATE DATABASE ${POSTGRES_DB}dist\"";
+    sudo -u postgres -H sh -c "psql -d \"${POSTGRES_DB}\" -c \"GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB}dist to ${USER};\""
+    sudo -u postgres -H sh -c "psql -d \"${POSTGRES_DB}\" -c \"ALTER DATABASE ${POSTGRES_DB}dist OWNER TO ${USER};\""
 
     if [ "$MONGO_ENABLE" -ge 1 ]; then
         sudo mkdir -p /data/{config,}db
@@ -910,9 +912,9 @@ function dependencies() {
     install_postgresql
 
     sudo -u postgres -H sh -c "psql -c \"CREATE USER ${USER} WITH PASSWORD '$PASSWD'\"";
-    sudo -u postgres -H sh -c "psql -c \"CREATE DATABASE ${USER}\"";
-    sudo -u postgres -H sh -c "psql -d \"${USER}\" -c \"GRANT ALL PRIVILEGES ON DATABASE ${USER} to ${USER};\""
-    sudo -u postgres -H sh -c "psql -d \"${USER}\" -c \"ALTER DATABASE ${USER} OWNER TO ${USER};\""
+    sudo -u postgres -H sh -c "psql -c \"CREATE DATABASE ${POSTGRES_DB}\"";
+    sudo -u postgres -H sh -c "psql -d \"${POSTGRES_DB}\" -c \"GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} to ${USER};\""
+    sudo -u postgres -H sh -c "psql -d \"${POSTGRES_DB}\" -c \"ALTER DATABASE ${POSTGRES_DB} OWNER TO ${USER};\""
 
     apt install apparmor-utils -y
     TCPDUMP_PATH=`which tcpdump`
@@ -1169,7 +1171,7 @@ function install_CAPE() {
     # copy *.conf.default to *.conf so we have all properly updated fields, as we can't ignore old configs in repository
     for filename in conf/*.conf.default; do cp -vf "./$filename" "./$(echo "$filename" | sed -e 's/.default//g')";  done
 
-    sed -i "/connection =/cconnection = postgresql://${USER}:${PASSWD}@localhost:5432/${USER}" conf/cuckoo.conf
+    sed -i "/connection =/cconnection = postgresql://${USER}:${PASSWD}@localhost:5432/${POSTGRES_DB}" conf/cuckoo.conf
     # sed -i "/tor/{n;s/enabled = no/enabled = yes/g}" conf/routing.conf
     # sed -i "/memory_dump = off/cmemory_dump = on" conf/cuckoo.conf
     # sed -i "/machinery =/cmachinery = kvm" conf/cuckoo.conf
