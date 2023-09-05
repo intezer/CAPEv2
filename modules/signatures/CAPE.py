@@ -254,7 +254,7 @@ class CAPE_InjectionProcessHollowing(Signature):
     ttps += ["T1055.012"]  # MITRE v7,8
     ttps += ["U1225"]  # Unprotect
     mbcs = ["OB0006", "E1055"]
-    allow_list = ["acrord32.exe"]
+    allow_list = ["acrord32.exe", "AcroRd32.exe"]
 
     def __init__(self, *args, **kwargs):
         Signature.__init__(self, *args, **kwargs)
