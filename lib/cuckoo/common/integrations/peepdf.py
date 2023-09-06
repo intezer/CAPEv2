@@ -4,6 +4,8 @@
 
 import contextlib
 import logging
+from typing import Any
+from typing import Dict
 
 from lib.cuckoo.common.utils import convert_to_printable
 
