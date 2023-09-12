@@ -12,7 +12,7 @@ import randmac
 import tqdm
 
 NETWORK_NAME = 'default'
-DEFAULT_STORAGE = '/data/vms/'
+DEFAULT_STORAGE = '/data/vm/'
 SLEEP_TIME = 650
 DEFAULT_SNAPSHOT_NAME = 'clean'
 
@@ -168,7 +168,7 @@ def clone_machines(original_machine_name: str,
     return machines
 
 
-def print_machines_config(machines):
+def print_machines_config(machines, machine_type):
     print('Please add these new machines to the appropriate config file (also in ./machines.conf):')
 
     with open('machines.conf', 'w') as machines_file:
@@ -178,7 +178,8 @@ def print_machines_config(machines):
                 f'label = {machine.name}',
                 f'platform = windows',
                 f'ip = {machine.ip}',
-                f'tags = x64'
+                f'arch = x64',
+                f'tags = x64,{machine_type}'
             ]
 
             machines_file.writelines(machine_lines)
@@ -205,6 +206,8 @@ if __name__ == '__main__':
     parser.add_argument('--count-offset', type=int, default=1, help='At what number should the count start')
 
     parser.add_argument('--ip', type=str, required=True, help='The base IP address machines should start to be created')
+    parser.add_argument('--machine-type', type=str, required=True,
+                        help='The OS type of the machine (win7/win10)', choices=['win7', 'win10'])
     parser.add_argument('--yes', action='store_true', help='Skip confirmation')
     args = parser.parse_args()
 
@@ -272,6 +275,6 @@ if __name__ == '__main__':
         init_machines(machines)
 
     print()
-    print_machines_config(machines)
+    print_machines_config(machines, args.machine_type)
 
 # sudo python3 clone-machines.py --dry-run --original win7-v4-clean --original-disk /data/vms/win7-v4-clean.qcow2 --prefix win7-v4 --count 1 --count-offset 10 --ip 192.168.1.186
