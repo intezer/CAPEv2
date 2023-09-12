@@ -116,6 +116,8 @@ passlist_file = proc_cfg.network.dnswhitelist_file
 
 enabled_ip_passlist = proc_cfg.network.ipwhitelist
 ip_passlist_file = proc_cfg.network.ipwhitelist_file
+
+enabled_network_passlist = proc_cfg.network.network_passlist
 network_passlist_file = proc_cfg.network.network_passlist_file
 
 # Be less verbose about httpreplay logging messages.
@@ -146,7 +148,7 @@ if HAVE_GEOIP and proc_cfg.network.maxmind_database:
     else:
         HAVE_GEOIP = False
 
-    if os.path.isfile(network_passlist_file):
+    if enabled_network_passlist and network_passlist_file and os.path.isfile(network_passlist_file):
         with open(os.path.join(CUCKOO_ROOT, network_passlist_file), "r") as f:
             for cidr in set(f.read().splitlines()):
                 if cidr.startswith("#") or len(cidr.strip()) == 0:
