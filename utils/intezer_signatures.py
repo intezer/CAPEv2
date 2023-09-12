@@ -19,7 +19,17 @@ import lib.cuckoo.common.colors as colors
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 
 log = logging.getLogger(__name__)
-URL = "https://bitbucket.org/intezer/cape-signatures/get/master.tar.gz"
+URL = "https://api.github.com/repos/intezer/cape-signatures/tarball"
+
+
+def _copy_files_to_directory(tar, src_prefix, dst_prefix, tar_members):
+    for member in tar_members:
+        if not member.name.startswith(src_prefix) or member.name == src_prefix:
+            continue
+
+        filepath = os.path.join(dst_prefix, member.name[len(src_prefix) + 1:])
+        open(filepath, "wb").write(tar.extractfile(member).read())
+        print('File "{}" {}'.format(filepath, colors.green("installed")))
 
 
 def download(user: str, password: str, path: str = None):
@@ -35,16 +45,13 @@ def download(user: str, password: str, path: str = None):
 
     members = tar.getmembers()
     directory = members[0].name.split("/")[0]
-    name_start = f'{directory}/signatures'
+    signature_prefix = f'{directory}/signatures'
+    allow_list_members_prefix = f'{directory}/allow_lists'
+    signature_dest = os.path.join(CUCKOO_ROOT, 'modules', 'signatures')
+    allow_list_dest = os.path.join(CUCKOO_ROOT, 'extra')
 
-    for member in members:
-        filepath = os.path.join(CUCKOO_ROOT, 'modules/signatures', member.name[len(name_start) + 1:])
-
-        if not member.name.startswith(name_start) or name_start == member.name:
-            continue
-
-        print('File "{}" {}'.format(filepath, colors.green("installed")))
-        open(filepath, "wb").write(tar.extractfile(member).read())
+    _copy_files_to_directory(tar, signature_prefix, signature_dest, members)
+    _copy_files_to_directory(tar, allow_list_members_prefix, allow_list_dest, members)
 
 
 def main():
