@@ -16,6 +16,7 @@
     "stack_pivot.py": {},
     "multiple_ua.py": {},
     "antisandbox_unhook.py": {},
-    "persistence_autorun.py": {}
+    "persistence_autorun.py": {},
+    "execution_suspicious.py" : {}
   }
 }
