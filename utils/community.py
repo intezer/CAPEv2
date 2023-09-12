@@ -34,15 +34,8 @@ if path_exists(os.path.join(CUCKOO_ROOT, "utils", "community_blocklist.py")):
 
 log = logging.getLogger(__name__)
 
-def get_signatures_modification_dict() -> dict:
-    file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                             'resources',
-                             'signatures_modification_dictionary.json')
-    with open(file_path) as f:
-        return json.load(f)
 
-
-def flare_capa(proxy=None):
+def flare_capa(proxy=None, offline_dest_folder: str = None):
     signature_urls = (
         "https://github.com/mandiant/capa/raw/master/sigs/1_flare_msvc_rtf_32_64.sig",
         "https://github.com/mandiant/capa/raw/master/sigs/2_flare_msvc_atlmfc_32_64.sig",
@@ -126,8 +119,6 @@ def install(enabled, force, rewrite, filepath: str = False, access_token=None, p
     members = t.getmembers()
     directory = members[0].name.split("/", 1)[0]
 
-    signatures_modification_dict = get_signatures_modification_dict()
-
     for category in enabled:
         folder = folders.get(category, False)
         if not folder:
@@ -159,10 +150,6 @@ def install(enabled, force, rewrite, filepath: str = False, access_token=None, p
 
             if filepath in blocklist.get(category, []):
                 print(f'You have blocklisted file: {dest_file}. {colors.yellow("skipped")}')
-                continue
-
-            # TODO: Replace this with blocklist
-            if category == 'signatures' and dest_file in signatures_modification_dict['reject_list']:
                 continue
 
             if not force:
@@ -275,7 +262,7 @@ def main():
             enabled.append("mitre")
 
     if args.capa_rules:
-        flare_capa(args.proxy)
+        flare_capa(args.proxy, args.capa_rules_path)
         if not enabled:
             return
 
