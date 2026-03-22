@@ -40,14 +40,8 @@ from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import get_options
+from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_FAILED_PROCESSING, TASK_FAILED_REPORTING, TASK_REPORTED, Task
 from lib.cuckoo.core.database import Database, init_database
-from lib.cuckoo.core.data.task import (
-    TASK_COMPLETED,
-    TASK_FAILED_PROCESSING,
-    TASK_FAILED_REPORTING,
-    TASK_REPORTED,
-    Task
-)
 from lib.cuckoo.core.plugins import RunProcessing, RunReporting, RunSignatures
 from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, init_modules
 
@@ -195,34 +189,33 @@ def init_worker():
     # See https://docs.sqlalchemy.org/en/14/core/pooling.html#using-connection-pools-with-multiprocessing-or-os-fork
     db.engine.dispose(close=False)
 
-    # Fix for open file handles on rotated logs in workers
-    for h in log.handlers[:]:
-        if isinstance(h, logging.FileHandler):
-            h.close()
-        log.removeHandler(h)
+    # Replace log handlers using direct list operations to avoid acquiring
+    # logging._lock or C-level FILE* locks, which may be inherited in a
+    # deadlocked state from the multi-threaded parent process (pebble runs
+    # 3 daemon threads). After fork we are the only thread so this is safe.
+    # Do NOT call handler.close() — it triggers fflush() which can deadlock
+    # on the inherited FILE* lock if a parent thread was mid-write at fork time.
+    log.handlers.clear()
 
-    # Restore Console Handler
     ch = ConsoleHandler()
     ch.setFormatter(FORMATTER)
-    log.addHandler(ch)
+    log.handlers.append(ch)
 
-    # Restore Syslog Handler if enabled
     if logconf.logger.syslog_process:
         try:
             slh = logging.handlers.SysLogHandler(address=logconf.logger.syslog_dev)
             slh.setFormatter(FORMATTER)
-            log.addHandler(slh)
+            log.handlers.append(slh)
         except Exception as e:
-            log.warning("Failed to restore Syslog handler in worker: %s", e)
+            print(f"Failed to restore Syslog handler in worker: {e}", file=sys.stderr)
 
-    # Restore File Handler using WatchedFileHandler to support rotation
     try:
         path = os.path.join(CUCKOO_ROOT, "log", "process.log")
         fh = logging.handlers.WatchedFileHandler(path)
         fh.setFormatter(FORMATTER)
-        log.addHandler(fh)
+        log.handlers.append(fh)
     except PermissionError as e:
-        log.warning("Failed to restore File handler in worker due to permissions: %s", e)
+        print(f"Failed to restore File handler in worker: {e}", file=sys.stderr)
 
 
 def get_formatter_fmt(task_id=None, main_task_id=None):
@@ -398,7 +391,13 @@ def processing_finished(future):
 
 
 def autoprocess(
-    parallel=1, failed_processing=False, maxtasksperchild=7, memory_debugging=False, processing_timeout=300, debug: bool = False, disable_memory_limit: bool = False
+    parallel=1,
+    failed_processing=False,
+    maxtasksperchild=7,
+    memory_debugging=False,
+    processing_timeout=300,
+    debug: bool = False,
+    disable_memory_limit: bool = False,
 ):
     """
     Automatically processes analysis data using a process pool.
@@ -652,7 +651,7 @@ def main():
             memory_debugging=args.memory_debugging,
             processing_timeout=args.processing_timeout,
             debug=args.debug,
-            disable_memory_limit= args.disable_memory_limit,
+            disable_memory_limit=args.disable_memory_limit,
         )
     else:
         for start, end in args.id:
