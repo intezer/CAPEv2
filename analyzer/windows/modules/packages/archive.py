@@ -112,6 +112,11 @@ class Archive(Package):
             log.debug("Replacing %s with %s", str(file_names), str(files_at_root))
             file_names = files_at_root
 
+        # Ensure file_names only contains files, not directories (e.g. from 7zip listing or os.listdir)
+        file_names = [f for f in file_names if os.path.isfile(os.path.join(root, f))]
+        if not file_names:
+            raise CuckooPackageError("Empty archive")
+
         upload_extracted_files(root, files_at_root)
 
         # Copy these files to the root directory, just in case!
