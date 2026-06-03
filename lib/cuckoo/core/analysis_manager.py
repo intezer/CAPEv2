@@ -22,7 +22,7 @@ from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import convert_to_printable, create_folder, get_memdump_path
 from lib.cuckoo.core.database import Database, _Database
-from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_PENDING, TASK_RUNNING, Task
+from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_FAILED_ANALYSIS, TASK_PENDING, TASK_RUNNING, Task
 from lib.cuckoo.core.data.machines import Machine
 from lib.cuckoo.core.data.guests import Guest
 from lib.cuckoo.core.guest import GuestManager
@@ -309,6 +309,7 @@ class AnalysisManager(threading.Thread):
     def machine_running(self) -> Generator[None, None, None]:
         assert self.machinery_manager and self.machine and self.guest
 
+        machine_is_dead = False
         try:
             with self.db.session.begin():
                 self.machinery_manager.start_machine(self.machine)
@@ -322,6 +323,7 @@ class AnalysisManager(threading.Thread):
             # This machine has turned dead, so we'll throw an exception
             # which informs the AnalysisManager that it should analyze
             # this task again with another available machine.
+            machine_is_dead = True
             self.log.exception(str(e))
 
             # Remove the guest from the database, so that we can assign a
@@ -337,6 +339,14 @@ class AnalysisManager(threading.Thread):
             shutil.rmtree(self.storage)
 
             raise CuckooDeadMachine(self.machine.name) from e
+        finally:
+            # Always stop/release the machine, even on an unexpected error, so the VM isn't left
+            # running and locked. The dead-machine branch already removed it, so skip that case.
+            if not machine_is_dead:
+                self._stop_and_release_machine()
+
+    def _stop_and_release_machine(self) -> None:
+        assert self.machinery_manager and self.machine
 
         with self.db.session.begin():
             try:
@@ -482,6 +492,15 @@ class AnalysisManager(threading.Thread):
                 # Put the task back in pending so that the schedule can attempt to choose a new machine.
                 self.db.set_status(self.task.id, TASK_PENDING)
             raise
+        except Exception:
+            # Any other failure must still mark the task terminal and release the machine, or it stays
+            # "running" forever (the analysis timeout only starts once the guest wait begins).
+            self.log.exception("Failure during analysis of task #%s", self.task.id)
+            with self.db.session.begin():
+                self.db.set_status(self.task.id, TASK_FAILED_ANALYSIS)
+                if hasattr(self, "machine") and self.machine:
+                    self.db.unlock_machine(self.machine)
+            return
         else:
             with self.db.session.begin():
                 self.db.set_status(self.task.id, TASK_COMPLETED)
