@@ -12,7 +12,7 @@ from sqlalchemy import select
 from lib.cuckoo.common.abstracts import Machinery
 from lib.cuckoo.common.config import Config, ConfigMeta
 from lib.cuckoo.core.analysis_manager import AnalysisManager
-from lib.cuckoo.core.data.task import TASK_RUNNING, Task
+from lib.cuckoo.core.data.task import TASK_FAILED_ANALYSIS, TASK_RUNNING, Task
 from lib.cuckoo.core.data.guests import Guest
 from lib.cuckoo.core.data.machines import Machine
 from lib.cuckoo.core.database import _Database
@@ -440,3 +440,37 @@ class TestAnalysisManager:
         assert analysis_man.init_storage() is True
         mocker.patch("lib.cuckoo.core.database._Database.view_sample", return_value=mock_sample())
         assert analysis_man.category_checks() is True
+
+    def test_machine_running_releases_machine_on_unexpected_error(
+        self, db: _Database, task: Task, machine: Machine, machinery_manager: MachineryManager, mocker: MockerFixture
+    ):
+        # A non-CuckooMachineError raised inside the context (e.g. an HTTP error while uploading the
+        # sample to the guest) must still stop and release the machine, otherwise the VM stays running
+        # and locked forever.
+        mgr = AnalysisManager(task=task, machine=machine, machinery_manager=machinery_manager)
+        with db.session.begin():
+            mgr.prepare_task_and_machine_to_start()
+            db.session.expunge_all()
+
+        mocker.patch.object(machinery_manager, "start_machine")
+        stop_machine = mocker.patch.object(machinery_manager, "stop_machine")
+        release = mocker.patch.object(machinery_manager.machinery, "release")
+
+        with pytest.raises(RuntimeError):
+            with mgr.machine_running():
+                raise RuntimeError("guest upload failed")
+
+        stop_machine.assert_called_once()
+        release.assert_called_once()
+
+    def test_launch_analysis_marks_failed_on_unexpected_error(self, db: _Database, task: Task, mocker: MockerFixture):
+        # Any unexpected failure during analysis must drive the task to a terminal state, otherwise it
+        # stays "running" forever (never times out, since the timeout only applies during the guest wait).
+        task_id = task.id
+        mgr = AnalysisManager(task=task)
+        mocker.patch.object(mgr, "perform_analysis", side_effect=RuntimeError("guest returned 500"))
+
+        mgr.launch_analysis()
+
+        with db.session.begin():
+            assert db.session.get(Task, task_id).status == TASK_FAILED_ANALYSIS
