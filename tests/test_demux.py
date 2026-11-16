@@ -95,27 +95,16 @@ class TestDemux:
         options = "password=foobar"
         demux.options2passwd(options)
 
-    def test_demux_junk_filter_default_rejects(self, tmp_path):
-        junk_file = tmp_path / "polyshell.txt"
-        junk_file.write_text("echo polyshell")
+    @pytest.mark.parametrize("name", ["polyshell.txt", "readme.txt", "LicenseServer.exe", "Makefile.yml"])
+    def test_demux_junk_filter_ignores_file_name(self, tmp_path, name):
+        sample_file = tmp_path / name
+        sample_file.write_text("echo polyshell")
 
-        # String filename
-        demuxed, errors = demux.demux_sample(filename=str(junk_file), package=None, options="", use_sflock=False)
-        assert demuxed == []
-        assert any("junk_filter" in err for err in errors)
-
-        # Bytes filename
-        demuxed, errors = demux.demux_sample(filename=str(junk_file).encode(), package=None, options="", use_sflock=False)
-        assert demuxed == []
-        assert any("junk_filter" in err for err in errors)
-
-    def test_demux_junk_filter_explicitly_disabled(self, tmp_path):
-        junk_file = tmp_path / "readme.txt"
-        junk_file.write_text("readme instructions")
-
-        demuxed, errors = demux.demux_sample(filename=str(junk_file), package=None, options="ignore_junk_filter=0", use_sflock=False)
-        assert demuxed == []
-        assert any("junk_filter" in err for err in errors)
+        for filename in (str(sample_file), str(sample_file).encode()):
+            demuxed, errors = demux.demux_sample(filename=filename, package=None, options="", use_sflock=False)
+            assert len(demuxed) == 1
+            assert demuxed[0][0] == str(sample_file).encode()
+            assert errors == []
 
     def test_demux_junk_filter_ignored_with_option(self, tmp_path):
         junk_file = tmp_path / "polyshell.txt"
@@ -137,12 +126,12 @@ class TestDemux:
             package=None,
         )
 
-        # By default (ignore_junk_filter=False), junk file is skipped
+        # By default a plain text child is not extracted (not a valid type)
         path, platform, magic, filesize = demux._sf_children(child, ignore_junk_filter=False)
         assert path == b""
         assert filesize == 14
 
-        # When ignore_junk_filter=True, junk file is extracted
+        # When ignore_junk_filter=True, every child is extracted
         path, platform, magic, filesize = demux._sf_children(child, ignore_junk_filter=True)
         assert path != b""
         assert os.path.exists(path)
@@ -150,6 +139,22 @@ class TestDemux:
         assert filesize == 14
         if os.path.exists(path):
             os.remove(path)
+
+    @pytest.mark.parametrize("filename", [b"License.exe", b"readme.txt", b"payload.yml", b".git/hooks/payload"])
+    def test_sf_children_extracts_pe_regardless_of_name(self, filename):
+        child = SimpleNamespace(
+            filename=filename,
+            contents=b"MZ\x90\x00",
+            platform="windows",
+            magic="PE32 executable (GUI) Intel 80386, for MS Windows",
+            filesize=4,
+            package=None,
+        )
+
+        path, _, _, _ = demux._sf_children(child, ignore_junk_filter=False)
+        assert path != b""
+        assert open(path, "rb").read() == b"MZ\x90\x00"
+        os.remove(path)
 
     @pytest.mark.parametrize(
         "magic_str",
