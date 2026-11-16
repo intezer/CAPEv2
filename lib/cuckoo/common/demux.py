@@ -282,22 +282,7 @@ def is_valid_package(package: str) -> bool:
     return any(ptype in package for ptype in VALID_PACKAGES)
 
 
-# list of junk extensions to skip
-JUNK_EXTENSIONS = {
-    b".yar",
-    b".yara",
-    b".md",
-    b".txt",
-    b".yml",
-    b".yaml",
-    b".gitignore",
-    b".gitattributes",
-    b".gitmodules",
-    b".pdb",
-}
-
-JUNK_NAMES = {b"license", b"copying", b"makefile", b"authors", b"readme"}
-
+# Junk is detected by content only: names and extensions are attacker-controlled (e.g. a PE named readme.txt)
 JUNK_MAGICS = (
     "Microsoft Roslyn C# debugging symbols",
     "MSVC program database",
@@ -309,17 +294,9 @@ JUNK_MAGICS = (
 # ToDo fix return type
 def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, str, str, int]:
     path_to_extract = b""
-    filename_lower = child.filename.lower()
 
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
-    if not ignore_junk_filter:
-        if any(filename_lower.endswith(ext) for ext in JUNK_EXTENSIONS):
-            return b"", child.platform, child.magic, child.filesize
-        if any(name in filename_lower for name in JUNK_NAMES):
-            return b"", child.platform, child.magic, child.filesize
-        if child.magic and any(m in child.magic for m in JUNK_MAGICS):
-            return b"", child.platform, child.magic, child.filesize
-    if b".github/" in filename_lower or b".git/" in filename_lower:
+    if not ignore_junk_filter and child.magic and any(m in child.magic for m in JUNK_MAGICS):
         return b"", child.platform, child.magic, child.filesize
 
     _, ext = os.path.splitext(child.filename)
@@ -474,16 +451,6 @@ def demux_sample(
     If file is a ZIP, extract its included files and return their file paths
     If file is an email, extracts its attachments and return their file paths (later we'll also extract URLs)
     """
-    # Skip junk files (unless analysis is forced via ignore_junk_filter option)
-    if not option_enabled(options, "ignore_junk_filter"):
-        filename_bytes = filename if isinstance(filename, bytes) else filename.encode()
-        filename_lower_bytes = filename_bytes.lower()
-        if any(filename_lower_bytes.endswith(ext) for ext in JUNK_EXTENSIONS) or any(
-            name in filename_lower_bytes for name in JUNK_NAMES
-        ):
-            filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
-            return [], [{"junk_filter": f"File {filename_str} skipped by junk filter"}]
-
     # sflock requires filename to be bytes object for Py3
     # TODO: Remove after checking all uses of demux_sample use bytes ~TheMythologist
     if isinstance(filename, str) and use_sflock:
