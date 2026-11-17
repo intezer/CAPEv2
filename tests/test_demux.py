@@ -11,6 +11,12 @@ import pytest
 from tcr_misc import get_sample
 
 from lib.cuckoo.common import demux
+from lib.cuckoo.common.config import Config
+
+
+def _set_junk_filter(monkeypatch, **junk_filter_cfg):
+    for attr, value in zip(("JUNK_EXTENSIONS", "JUNK_NAMES", "JUNK_PATHS", "JUNK_MAGICS"), demux.load_junk_filter(junk_filter_cfg)):
+        monkeypatch.setattr(demux, attr, value)
 
 
 @pytest.fixture
@@ -197,3 +203,60 @@ class TestDemux:
         if os.path.exists(path):
             os.remove(path)
 
+    def test_load_junk_filter_defaults_match_web_conf(self):
+        assert demux.load_junk_filter(Config("web").junk_filter) == demux.load_junk_filter({})
+        assert (demux.JUNK_EXTENSIONS, demux.JUNK_NAMES, demux.JUNK_PATHS, demux.JUNK_MAGICS) == demux.load_junk_filter({})
+
+    def test_load_junk_filter_disabled(self):
+        assert demux.load_junk_filter({"enabled": False, "names": "license"}) == ((), (), (), ())
+
+    def test_load_junk_filter_empty_and_invalid_values(self):
+        extensions, names, paths, magics = demux.load_junk_filter({"extensions": "", "names": " README , ", "paths": 5})
+        assert extensions == ()
+        assert names == (b"readme",)
+        assert paths == (b".git/", b".github/")
+        assert magics == demux.load_junk_filter({})[3]
+
+    def test_demux_junk_filter_reports_rule_and_matches_basename(self, tmp_path):
+        license_file = tmp_path / "3iLicenseServer.exe"
+        license_file.write_text("MZ")
+        demuxed, errors = demux.demux_sample(filename=str(license_file), package=None, options="", use_sflock=False)
+        assert demuxed == []
+        assert "(name: license)" in errors[0]["junk_filter"]
+
+        sample_dir = tmp_path / "readme_files"
+        sample_dir.mkdir()
+        sample_file = sample_dir / "sample.exe"
+        sample_file.write_text("MZ")
+        demuxed, errors = demux.demux_sample(filename=str(sample_file), package=None, options="", use_sflock=False)
+        assert len(demuxed) == 1
+        assert errors == []
+
+    @pytest.mark.parametrize("name", ["3iLicenseServer.exe", "readme.txt", "Makefile.yml"])
+    def test_demux_junk_filter_content_only_accepts_named_files(self, tmp_path, monkeypatch, name):
+        _set_junk_filter(monkeypatch, extensions="", names="", paths="")
+        sample_file = tmp_path / name
+        sample_file.write_text("echo polyshell")
+
+        demuxed, errors = demux.demux_sample(filename=str(sample_file), package=None, options="", use_sflock=False)
+        assert len(demuxed) == 1
+        assert errors == []
+
+    @pytest.mark.parametrize("filename", [b"License.exe", b"readme.txt", b".git/hooks/payload"])
+    def test_sf_children_content_only_extracts_pe_and_skips_pdb(self, monkeypatch, filename):
+        _set_junk_filter(monkeypatch, extensions="", names="", paths="")
+        pe_child = SimpleNamespace(
+            filename=filename,
+            contents=b"MZ\x90\x00",
+            platform="windows",
+            magic="PE32 executable (GUI) Intel 80386, for MS Windows",
+            filesize=4,
+            package=None,
+        )
+        path, _, _, _ = demux._sf_children(pe_child, ignore_junk_filter=False)
+        assert path != b""
+        os.remove(path)
+
+        pdb_child = SimpleNamespace(**{**vars(pe_child), "magic": "MSVC program database ver 7.00"})
+        path, _, _, _ = demux._sf_children(pdb_child, ignore_junk_filter=False)
+        assert path == b""

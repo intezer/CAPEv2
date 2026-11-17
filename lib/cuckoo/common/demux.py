@@ -282,28 +282,52 @@ def is_valid_package(package: str) -> bool:
     return any(ptype in package for ptype in VALID_PACKAGES)
 
 
-# list of junk extensions to skip
-JUNK_EXTENSIONS = {
-    b".yar",
-    b".yara",
-    b".md",
-    b".txt",
-    b".yml",
-    b".yaml",
-    b".gitignore",
-    b".gitattributes",
-    b".gitmodules",
-    b".pdb",
+# Junk filter defaults, overridable in the [junk_filter] section of web.conf
+JUNK_FILTER_DEFAULTS = {
+    "extensions": ".yar,.yara,.md,.txt,.yml,.yaml,.gitignore,.gitattributes,.gitmodules,.pdb",
+    "names": "license,copying,makefile,authors,readme",
+    "paths": ".git/,.github/",
+    "magics": "Microsoft Roslyn C# debugging symbols,MSVC program database,Microsoft C/C++ MSF,Microsoft C/C++ program database",
 }
 
-JUNK_NAMES = {b"license", b"copying", b"makefile", b"authors", b"readme"}
 
-JUNK_MAGICS = (
-    "Microsoft Roslyn C# debugging symbols",
-    "MSVC program database",
-    "Microsoft C/C++ MSF",
-    "Microsoft C/C++ program database",
-)
+def _junk_filter_list(junk_filter_cfg: dict, key: str) -> Tuple[str, ...]:
+    """Comma-separated [junk_filter] value; empty disables that check, invalid falls back to the default."""
+    value = junk_filter_cfg.get(key, JUNK_FILTER_DEFAULTS[key])
+    if not isinstance(value, str):
+        log.error("Invalid value for junk_filter.%s in web.conf, using the default", key)
+        value = JUNK_FILTER_DEFAULTS[key]
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def load_junk_filter(junk_filter_cfg: dict) -> Tuple[Tuple[bytes, ...], Tuple[bytes, ...], Tuple[bytes, ...], Tuple[str, ...]]:
+    """Return (extensions, names, paths, magics) for the junk filter; all empty when disabled."""
+    if not junk_filter_cfg.get("enabled", True):
+        return (), (), (), ()
+    extensions, names, paths = (
+        tuple(item.lower().encode() for item in _junk_filter_list(junk_filter_cfg, key)) for key in ("extensions", "names", "paths")
+    )
+    return extensions, names, paths, _junk_filter_list(junk_filter_cfg, "magics")
+
+
+JUNK_EXTENSIONS, JUNK_NAMES, JUNK_PATHS, JUNK_MAGICS = load_junk_filter(getattr(web_cfg, "junk_filter", {}))
+
+
+def _junk_name_rule(filename: bytes) -> str:
+    """Junk rule matched by the file name (extension or basename substring), or empty string."""
+    basename = os.path.basename(filename.lower())
+    if ext := next((ext for ext in JUNK_EXTENSIONS if basename.endswith(ext)), None):
+        return f"extension: {ext.decode()}"
+    if name := next((name for name in JUNK_NAMES if name in basename), None):
+        return f"name: {name.decode()}"
+    return ""
+
+
+def _junk_magic_rule(magic: str) -> str:
+    """Junk rule matched by the file type, or empty string."""
+    if magic and (junk_magic := next((m for m in JUNK_MAGICS if m in magic), None)):
+        return f"magic: {junk_magic}"
+    return ""
 
 
 # ToDo fix return type
@@ -312,14 +336,9 @@ def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, s
     filename_lower = child.filename.lower()
 
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
-    if not ignore_junk_filter:
-        if any(filename_lower.endswith(ext) for ext in JUNK_EXTENSIONS):
-            return b"", child.platform, child.magic, child.filesize
-        if any(name in filename_lower for name in JUNK_NAMES):
-            return b"", child.platform, child.magic, child.filesize
-        if child.magic and any(m in child.magic for m in JUNK_MAGICS):
-            return b"", child.platform, child.magic, child.filesize
-    if b".github/" in filename_lower or b".git/" in filename_lower:
+    if not ignore_junk_filter and (_junk_name_rule(child.filename) or _junk_magic_rule(child.magic)):
+        return b"", child.platform, child.magic, child.filesize
+    if any(path in filename_lower for path in JUNK_PATHS):
         return b"", child.platform, child.magic, child.filesize
 
     _, ext = os.path.splitext(child.filename)
@@ -477,12 +496,9 @@ def demux_sample(
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
     if not option_enabled(options, "ignore_junk_filter"):
         filename_bytes = filename if isinstance(filename, bytes) else filename.encode()
-        filename_lower_bytes = filename_bytes.lower()
-        if any(filename_lower_bytes.endswith(ext) for ext in JUNK_EXTENSIONS) or any(
-            name in filename_lower_bytes for name in JUNK_NAMES
-        ):
+        if junk_rule := _junk_name_rule(filename_bytes):
             filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
-            return [], [{"junk_filter": f"File {filename_str} skipped by junk filter"}]
+            return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
     # sflock requires filename to be bytes object for Py3
     # TODO: Remove after checking all uses of demux_sample use bytes ~TheMythologist
@@ -509,9 +525,9 @@ def demux_sample(
     # don't try to extract from office docs
     magic = File(filename).get_type() or ""
 
-    if not option_enabled(options, "ignore_junk_filter") and any(m in magic for m in JUNK_MAGICS):
+    if not option_enabled(options, "ignore_junk_filter") and (junk_rule := _junk_magic_rule(magic)):
         filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
-        return [], [{"junk_filter": f"File {filename_str} skipped by junk filter"}]
+        return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
     # --- 3. Handle Password-Protected Office Files ---
     is_office = ("Microsoft" in magic or any(x in magic for x in OFFICE_TYPES)) and not any(x in magic for x in MS_EXCLUDE)
