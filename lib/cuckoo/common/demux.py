@@ -6,6 +6,7 @@ import re
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
 from lib.cuckoo.common.config import Config
@@ -282,63 +283,62 @@ def is_valid_package(package: str) -> bool:
     return any(ptype in package for ptype in VALID_PACKAGES)
 
 
-# Junk filter defaults, overridable in the [junk_filter] section of web.conf
-JUNK_FILTER_DEFAULTS = {
-    "extensions": ".yar,.yara,.md,.txt,.yml,.yaml,.gitignore,.gitattributes,.gitmodules,.pdb",
-    "names": "license,copying,makefile,authors,readme",
-    "paths": ".git/,.github/",
-    "magics": "Microsoft Roslyn C# debugging symbols,MSVC program database,Microsoft C/C++ MSF,Microsoft C/C++ program database",
-}
-
-
-def _parse_junk_filter_list(junk_filter_cfg: dict, key: str) -> Tuple[str, ...]:
-    """Split a comma-separated [junk_filter] value; empty disables that check, invalid falls back to the default."""
-    value = junk_filter_cfg.get(key, JUNK_FILTER_DEFAULTS[key])
-    if not isinstance(value, str):
-        log.error("Invalid value for junk_filter.%s in web.conf, using the default", key)
-        value = JUNK_FILTER_DEFAULTS[key]
+def _split_list(value: str) -> Tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
-def load_junk_filter(junk_filter_cfg: dict) -> Tuple[Tuple[bytes, ...], Tuple[bytes, ...], Tuple[bytes, ...], Tuple[str, ...]]:
-    """Return (extensions, names, paths, magics) for the junk filter; all empty when disabled."""
-    if not junk_filter_cfg.get("enabled", True):
-        return (), (), (), ()
-    extensions, names, paths = (
-        tuple(item.lower().encode() for item in _parse_junk_filter_list(junk_filter_cfg, key)) for key in ("extensions", "names", "paths")
-    )
-    return extensions, names, paths, _parse_junk_filter_list(junk_filter_cfg, "magics")
+@dataclass(frozen=True)
+class JunkFilter:
+    """Rules for skipping junk files, from the [junk_filter] section of web.conf."""
+
+    extensions: Tuple[bytes, ...] = ()
+    names: Tuple[bytes, ...] = ()
+    paths: Tuple[bytes, ...] = ()
+    magics: Tuple[str, ...] = ()
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "JunkFilter":
+        if not cfg.get("enabled"):
+            return cls()
+        extensions, names, paths = (
+            tuple(item.lower().encode() for item in _split_list(cfg[key])) for key in ("extensions", "names", "paths")
+        )
+        return cls(extensions, names, paths, _split_list(cfg["magics"]))
+
+    def match_name(self, filename: bytes) -> Optional[str]:
+        """Return the rule the file name matches, e.g. "name: license", or None."""
+        basename = os.path.basename(filename.lower())
+        for extension in self.extensions:
+            if basename.endswith(extension):
+                return f"extension: {extension.decode()}"
+        for name in self.names:
+            if name in basename:
+                return f"name: {name.decode()}"
+        return None
+
+    def match_magic(self, magic: Optional[str]) -> Optional[str]:
+        """Return the rule the file type matches, e.g. "magic: MSVC program database", or None."""
+        for junk_magic in self.magics:
+            if magic and junk_magic in magic:
+                return f"magic: {junk_magic}"
+        return None
+
+    def is_junk_path(self, filename: bytes) -> bool:
+        filename = filename.lower()
+        return any(path in filename for path in self.paths)
 
 
-JUNK_EXTENSIONS, JUNK_NAMES, JUNK_PATHS, JUNK_MAGICS = load_junk_filter(getattr(web_cfg, "junk_filter", {}))
-
-
-def _find_junk_name_rule(filename: bytes) -> Optional[str]:
-    """Return the junk rule the file name matches (e.g. "name: license", "extension: .txt"), or None."""
-    basename = os.path.basename(filename.lower())
-    if ext := next((ext for ext in JUNK_EXTENSIONS if basename.endswith(ext)), None):
-        return f"extension: {ext.decode()}"
-    if name := next((name for name in JUNK_NAMES if name in basename), None):
-        return f"name: {name.decode()}"
-    return None
-
-
-def _find_junk_magic_rule(magic: str) -> Optional[str]:
-    """Return the junk rule the file type matches (e.g. "magic: MSVC program database"), or None."""
-    if magic and (junk_magic := next((m for m in JUNK_MAGICS if m in magic), None)):
-        return f"magic: {junk_magic}"
-    return None
+junk_filter = JunkFilter.from_config(web_cfg.junk_filter)
 
 
 # ToDo fix return type
 def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, str, str, int]:
     path_to_extract = b""
-    filename_lower = child.filename.lower()
 
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
-    if not ignore_junk_filter and (_find_junk_name_rule(child.filename) or _find_junk_magic_rule(child.magic)):
+    if not ignore_junk_filter and (junk_filter.match_name(child.filename) or junk_filter.match_magic(child.magic)):
         return b"", child.platform, child.magic, child.filesize
-    if any(path in filename_lower for path in JUNK_PATHS):
+    if junk_filter.is_junk_path(child.filename):
         return b"", child.platform, child.magic, child.filesize
 
     _, ext = os.path.splitext(child.filename)
@@ -496,7 +496,7 @@ def demux_sample(
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
     if not option_enabled(options, "ignore_junk_filter"):
         filename_bytes = filename if isinstance(filename, bytes) else filename.encode()
-        if junk_rule := _find_junk_name_rule(filename_bytes):
+        if junk_rule := junk_filter.match_name(filename_bytes):
             filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
             return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
@@ -525,7 +525,7 @@ def demux_sample(
     # don't try to extract from office docs
     magic = File(filename).get_type() or ""
 
-    if not option_enabled(options, "ignore_junk_filter") and (junk_rule := _find_junk_magic_rule(magic)):
+    if not option_enabled(options, "ignore_junk_filter") and (junk_rule := junk_filter.match_magic(magic)):
         filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
         return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
