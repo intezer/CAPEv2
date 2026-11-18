@@ -201,13 +201,15 @@ class TestHuntViews(SimpleTestCase):
         self.assertIn("target.file.name", match_stage)
 
     @patch("analysis.views.db.session.get")
-    @patch("analysis.views.db.session.commit")
-    def test_tag_tasks_endpoint_works(self, mock_commit, mock_get):
+    def test_tag_tasks_endpoint_works(self, mock_get):
         """The tag_tasks API should properly add and append custom tags to SQL Task entries."""
         # Use side_effect to return distinct Task mocks for each call, avoiding mock mutation reuse
+        tasks = []
+
         def mock_get_task(model, tid):
             task = MagicMock()
             task.tags_tasks = "existing_tag"
+            tasks.append(task)
             return task
         mock_get.side_effect = mock_get_task
 
@@ -225,8 +227,8 @@ class TestHuntViews(SimpleTestCase):
         self.assertEqual(data["tag"], "New_Campaign")
         self.assertEqual(data["updated_count"], 2)
 
-        # Verify commit happened
-        self.assertTrue(mock_commit.called)
+        # Tags are appended on the ORM objects; the request transaction commits them.
+        self.assertEqual([t.tags_tasks for t in tasks], ["existing_tag,New_Campaign"] * 2)
 
     @patch("analysis.views.mongo_aggregate", create=True)
     def test_hunt_page_category_filtering_works(self, mock_mongo_aggregate):
@@ -271,3 +273,35 @@ class TestHuntViews(SimpleTestCase):
         self.assertNotIn("PE Import Hashes", html_content)
         self.assertNotIn("Shared HTTP Request URIs", html_content)
         self.assertNotIn("Shared Signatures", html_content)
+
+    @patch("analysis.views.perform_search", return_value=None)
+    def test_search_zipall_does_not_crash_on_empty_or_substring_term(self, _mock_search):
+        """Ensure search template does not raise NoReverseMatch when ZIPPED_DOWNLOAD_ALL is enabled
+        and term_only is empty, a substring ('type'), or value_only contains regex characters."""
+        orig_zipped = getattr(settings, "ZIPPED_DOWNLOAD_ALL", False)
+        try:
+            settings.ZIPPED_DOWNLOAD_ALL = True
+            # Unprefixed query with leading '(' leaves term_only=""
+            resp = self.client.get("/analysis/search/", {"search": "(" + "a" * 64})
+            self.assertEqual(resp.status_code, 200)
+            html = resp.content.decode()
+            self.assertNotIn("Download All Matches", html)
+            self.assertNotIn("Note: Hash searches match all generated files", html)
+
+            # Substring term 'type' must not match 'capetype'
+            resp_type = self.client.get("/analysis/search/", {"search": "type:PE32 executable"})
+            self.assertEqual(resp_type.status_code, 200)
+            self.assertNotIn("Download All Matches", resp_type.content.decode())
+
+            # Valid 'capeyara' with word characters renders the zipall download link
+            resp_yara = self.client.get("/analysis/search/", {"search": "capeyara:TestRule_1"})
+            self.assertEqual(resp_yara.status_code, 200)
+            self.assertIn("/file/capeyarazipall/1/TestRule_1/", resp_yara.content.decode())
+
+            # Regex characters in 'capeyara' value degrade gracefully without NoReverseMatch
+            resp_regex = self.client.get("/analysis/search/", {"search": "capeyara:(RuleA|RuleB)"})
+            self.assertEqual(resp_regex.status_code, 200)
+            self.assertNotIn("Download All Matches", resp_regex.content.decode())
+        finally:
+            settings.ZIPPED_DOWNLOAD_ALL = orig_zipped
+

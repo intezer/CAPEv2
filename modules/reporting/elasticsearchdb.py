@@ -137,8 +137,13 @@ class ElasticSearchDB(Report):
 
     def date_hook(self, json_dict):
         for key, value in json_dict.items():
-            with suppress(Exception):
-                json_dict[key] = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            # A leading digit, a '-' and a ':' are all necessary for "%Y-%m-%d %H:%M:%S"
+            # to parse, so nothing that used to be converted stops being converted. The
+            # unguarded version built an exception for every value in the report tree,
+            # including every int and list.
+            if type(value) is str and value[:1].isdigit() and "-" in value and ":" in value:
+                with suppress(Exception):
+                    json_dict[key] = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
         return json_dict
 
     def run(self, results):
@@ -161,13 +166,39 @@ class ElasticSearchDB(Report):
         # the original dictionary and possibly compromise the following
         # reporting modules.
         report = get_json_document(results, self.analysis_path)
+        if not report or "info" not in report:
+            log.error("Failed to get JSON document or 'info' key is missing for Task")
+            return
+
+        local_task_id = int(report["info"].get("id", 0) or 0)
+        attributes = (self.task or {}).get("attributes") or {}
+        if main_task_id := attributes.get("main_task_id"):
+            with suppress(ValueError, TypeError):
+                report["info"]["id"] = int(main_task_id)
+                if local_task_id:
+                    report["info"].setdefault("local_task_id", local_task_id)
+
+        if not int(report["info"].get("id", 0) or 0):
+            log.error("Task ID is missing in report['info']")
+            return
+
+        from lib.cuckoo.common.hooks import run_report_hooks
+
+        run_report_hooks(report, task=self.task, stage="elasticsearchdb")
+
         self.fix_fields(report)
-        report = json.loads(json.dumps(report, default=str), object_hook=self.date_hook)
+
+        # insert_calls moves the api calls out into the separate calls index. The json
+        # round-trip below used to run before it, so the entire behaviour log - by far
+        # the largest structure in the report, commonly millions of entries - was
+        # serialised and re-parsed only to be discarded on the next line.
         new_processes = insert_calls(report, elastic_db=elastic_handler)
 
         # Store the results in the report.
         report["behavior"] = dict(report.get("behavior") or {})
         report["behavior"]["processes"] = new_processes
+
+        report = json.loads(json.dumps(report, default=str), object_hook=self.date_hook)
 
         delete_analysis_and_related_calls(report["info"]["id"])
         self.format_dates(report)
@@ -180,3 +211,5 @@ class ElasticSearchDB(Report):
         except Exception as e:
             log.error(e)
             return
+
+        run_report_hooks(report, task=self.task, stage="post_elasticsearchdb")

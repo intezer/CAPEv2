@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from lib.cuckoo.common.abstracts import Processing
+from lib.cuckoo.common.utils import get_cape_external_dir
 
 # Sysmon Event XML lives in this namespace; ElementTree returns tag names
 # already qualified, so we strip the prefix when reading element names.
@@ -461,7 +462,7 @@ class NetworkETW(Processing):
         if not (HAVE_EVTX or HAVE_EVTX_RS) or not os.path.exists(evtx_path):
             return connections, pid_to_image, dns_queries
 
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = tempfile.mkdtemp(prefix="evtx_", dir=get_cape_external_dir())
         try:
             with zipfile.ZipFile(evtx_path) as z:
                 sysmon_files = sorted([f for f in z.namelist() if "Sysmon" in f])
@@ -665,9 +666,19 @@ class NetworkETW(Processing):
         _dns_intents = (
             (self.results.get("behavior") or {})
             .get("network_map", {})
-            .get("dns_intents", {})
-        ) or {}
-        for _host, _intents in _dns_intents.items():
+            .get("dns_intents")
+        ) or []
+        if isinstance(_dns_intents, dict):
+            _dns_intent_pairs = _dns_intents.items()
+        elif isinstance(_dns_intents, list):
+            _dns_intent_pairs = [
+                (item.get("domain", ""), item.get("intents") or [])
+                for item in _dns_intents
+                if isinstance(item, dict)
+            ]
+        else:
+            _dns_intent_pairs = ()
+        for _host, _intents in _dns_intent_pairs:
             for _intent in _intents or []:
                 _proc_info = _intent.get("process") or {}
                 _pid = str(_proc_info.get("process_id") or "")
@@ -875,7 +886,7 @@ class NetworkETW(Processing):
                 if apply(rec, hit):
                     enriched[proto] += 1
 
-        # network.http_ex / network.https_ex — httpreplay-extracted HTTP
+        # network.http_ex / network.https_ex — tshark-extracted HTTP
         # transactions carry full src/sport/dst/dport so flow lookup is
         # exact. Without this, the HTTP details panel shows "-" even
         # though suricata.http for the same flow is attributed.

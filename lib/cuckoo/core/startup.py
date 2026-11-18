@@ -54,7 +54,7 @@ from lib.cuckoo.core.database import Database
 from lib.cuckoo.core.data.task import TASK_FAILED_ANALYSIS, TASK_RUNNING
 from lib.cuckoo.core.log import ConsoleHandler, init_json_file_handler, init_logger
 from lib.cuckoo.core.plugins import import_package, import_plugin, list_plugins
-from lib.cuckoo.core.rooter import gateways, rooter, socks5s, vpns
+from lib.cuckoo.core.rooter import gateways, rooter, rooter_required, socks5s, vpns
 
 log = logging.getLogger()
 
@@ -242,7 +242,7 @@ def validate_default_route(routing_cfg):
     (from gateways global) when nexthop is enabled, bypassing the vpn.enabled gate.
     Extracted from init_routing so it is independently unit-testable (review H3)."""
     route = routing_cfg.routing.route
-    if route in ("none", "internet", "tor", "inetsim"):
+    if str(route).lower() in ("none", "drop", "false", "internet", "tor", "inetsim"):
         return
     nexthop_on = hasattr(routing_cfg, "nexthop") and routing_cfg.nexthop.enabled
     if nexthop_on and (route in gateways or route in _POLICY_TOKENS or route == "nexthop"):
@@ -304,7 +304,8 @@ def check_working_directory():
 
 def check_webgui_mongo(exit_on_connection_failure=True):
     if repconf.mongodb.enabled:
-        from dev_utils.mongodb import connect_to_mongo, mongo_create_index
+        import dev_utils.mongodb as mdb_mod
+        from dev_utils.mongodb import close_mongodb, connect_to_mongo, mongo_create_index
 
         client = connect_to_mongo()
         if not client:
@@ -317,48 +318,59 @@ def check_webgui_mongo(exit_on_connection_failure=True):
             log.warning(message)
             return
 
-        # Create required indexes to improve scalability with large amounts of data.
-        # Note: Silently ignores creation if an equivalent index already exists.
-        index_configs = [
-            ("analysis", [("info.id", -1)], {"name": "info_id_desc"}),
-            ("calls", [("task_id", 1)], {"name": "task_id_1"}),
-            ("files", [("_task_ids", 1)], {}),
-        ]
-        if repconf.mongodb.get("index_yara", False):
-            index_configs.extend([
-                ("files", "yara.name", {"name": "yara_name"}),
-                ("files", "cape_yara.name", {"name": "cape_yara_name"}),
-            ])
-        if repconf.mongodb.get("index_clamav", False):
-            index_configs.append(("files", "clamav", {"name": "clamav_index"}))
-        if repconf.mongodb.get("index_hashes", False):
-            index_configs.extend([
-                ("files", "md5", {"name": "file_md5"}),
-                ("files", "sha1", {"name": "file_sha1"}),
-                ("files", "ssdeep", {"name": "file_ssdeep"}),
-            ])
-        if repconf.mongodb.get("index_detections", False):
-            index_configs.append(("analysis", [("detections.family", 1), ("_id", -1)], {"name": "detections_family_id_desc"}))
-        if repconf.mongodb.get("index_filenames", False):
-            index_configs.append(("analysis", [("target.file.name", 1), ("_id", -1)], {"name": "target_file_name_id_desc"}))
+        if mdb_mod._client is None and hasattr(client, "__getitem__"):
+            mdb_mod._client = client
+            with suppress(Exception):
+                mdb_mod._results_db = client[mdb_mod.mdb]
 
-        # Obsolete indexes to drop
-        obsolete_indexes = {
-            "analysis": ["info.id_1", "detections_family", "name_1", "detections_family_1", "target_file_name_1"],
-        }
+        try:
+            # Create required indexes to improve scalability with large amounts of data.
+            # Note: Silently ignores creation if an equivalent index already exists.
+            index_configs = [
+                ("analysis", [("info.id", -1)], {"name": "info_id_desc"}),
+                ("calls", [("task_id", 1)], {"name": "task_id_1"}),
+                ("files", [("_task_ids", 1)], {}),
+            ]
+            if repconf.mongodb.get("index_yara", False):
+                index_configs.extend([
+                    ("files", "yara.name", {"name": "yara_name"}),
+                    ("files", "cape_yara.name", {"name": "cape_yara_name"}),
+                ])
+            if repconf.mongodb.get("index_clamav", False):
+                index_configs.append(("files", "clamav", {"name": "clamav_index"}))
+            if repconf.mongodb.get("index_hashes", False):
+                index_configs.extend([
+                    ("files", "md5", {"name": "file_md5"}),
+                    ("files", "sha1", {"name": "file_sha1"}),
+                    ("files", "ssdeep", {"name": "file_ssdeep"}),
+                ])
+            if repconf.mongodb.get("index_detections", False):
+                index_configs.append(("analysis", [("detections.family", 1), ("_id", -1)], {"name": "detections_family_id_desc"}))
+            if repconf.mongodb.get("index_filenames", False):
+                index_configs.append(("analysis", [("target.file.name", 1), ("_id", -1)], {"name": "target_file_name_id_desc"}))
 
-        for coll, keys, kwargs in index_configs:
-            try:
-                mongo_create_index(coll, keys, **kwargs)
-            except Exception as e:
-                log.warning("Failed to create MongoDB index %s on %s: %s", kwargs.get("name", keys), coll, e)
+            # Obsolete indexes to drop
+            obsolete_indexes = {
+                "analysis": ["info.id_1", "detections_family", "name_1", "detections_family_1", "target_file_name_1"],
+            }
 
-        # Drop obsolete indexes
-        from dev_utils.mongodb import results_db
-        for coll, indexes in obsolete_indexes.items():
-            for index_name in indexes:
+            for coll, keys, kwargs in index_configs:
+                try:
+                    mongo_create_index(coll, keys, **kwargs)
+                except Exception as e:
+                    log.warning("Failed to create MongoDB index %s on %s: %s", kwargs.get("name", keys), coll, e)
+
+            # Drop obsolete indexes
+            from dev_utils.mongodb import results_db
+            for coll, indexes in obsolete_indexes.items():
+                for index_name in indexes:
+                    with suppress(Exception):
+                        getattr(results_db, coll).drop_index(index_name)
+        finally:
+            if client is not mdb_mod._client and hasattr(client, "close"):
                 with suppress(Exception):
-                    getattr(results_db, coll).drop_index(index_name)
+                    client.close()
+            close_mongodb()
     elif repconf.elasticsearchdb.enabled:
         # ToDo add check
         pass
@@ -464,11 +476,13 @@ def init_console_logging():
             log.removeHandler(h)
             h.close()
 
-    ch = ConsoleHandler()
-    ch.setFormatter(formatter)
-    log.addHandler(ch)
-
-    log.setLevel(logging.INFO)
+    has_console = any(isinstance(h, ConsoleHandler) for h in log.handlers)
+    if not has_console:
+        ch = ConsoleHandler()
+        ch.setFormatter(formatter)
+        log.addHandler(ch)
+        if log.level == logging.NOTSET or log.level > logging.INFO:
+            log.setLevel(logging.INFO)
 
 
 def init_tasks():
@@ -519,6 +533,10 @@ def init_modules():
     # Import machine manager.
     import_plugin(f"modules.machinery.{cuckoo.cuckoo.machinery}")
     check_snapshot_state()
+
+    from lib.cuckoo.common.hooks import bootstrap_tenancy
+
+    bootstrap_tenancy(cuckoo)
 
     for category, entries in list_plugins().items():
         log.debug('Imported "%s" modules:', category)
@@ -621,24 +639,6 @@ def check_snapshot_state():
             conn.close()
 
 
-def _tolerate_missing_rooter():
-    """True when this node is a central MANAGEMENT node ([central_mode] tolerate_missing_rooter=yes):
-    it advertises the fleet's route options on the submission form but never routes guest traffic
-    itself -- only workers route. Callers (init_rooter / init_routing) then skip the rooter
-    reachability check + all route verification/NAT setup, while still populating vpns/socks5s for the
-    form. This is gated on the FLAG ALONE, NOT on whether the rooter socket is reachable: a central UI
-    built from the worker AMI may have cape-rooter running but no tun0/VPN infra, so rt_available/
-    nic_available would answer 'not available' and raise CuckooStartupError even though a rooter is
-    up. Default off, so single-node and workers (central mode on, flag off) verify their routing and
-    fail fast normally."""
-    try:
-        from lib.cuckoo.common.central_mode import central_mode_config
-
-        return bool(central_mode_config().tolerate_missing_rooter)
-    except Exception:
-        return False
-
-
 def init_rooter(apply_state=False):
     """If required, check whether the rooter is running and whether we can connect to it.
 
@@ -650,15 +650,7 @@ def init_rooter(apply_state=False):
 
     # The default configuration doesn't require the rooter to be ran.
     # A nexthop-only node still needs the rooter for forward_drop() + fail-closed arm.
-    _nexthop_enabled = hasattr(routing, "nexthop") and routing.nexthop.enabled
-    if (
-        not routing.vpn.enabled
-        and not routing.tor.enabled
-        and not routing.inetsim.enabled
-        and not routing.socks5.enabled
-        and routing.routing.route == "none"
-        and not _nexthop_enabled
-    ):
+    if not rooter_required(routing):
         return
 
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -666,20 +658,6 @@ def init_rooter(apply_state=False):
     try:
         s.connect(cuckoo.cuckoo.rooter)
     except socket.error as e:
-        # Central-mode management node (the UI): the web/API process advertises the fleet's route
-        # options on the submission form but never routes traffic itself -- only the worker's
-        # scheduler does. When THIS node opts in via [central_mode] tolerate_missing_rooter, an
-        # unreachable rooter is expected, so warn and continue instead of blocking UI startup. The
-        # scheduler (apply_state=True) still fails fast; workers (which run central mode too but do
-        # NOT set this flag) and single-node keep failing fast. Gated on the explicit flag -- NOT
-        # central_mode.enabled -- so a worker whose rooter died still refuses to come up (codex).
-        if not apply_state and _tolerate_missing_rooter():
-            log.warning(
-                "rooter unreachable (%s); this node has [central_mode] tolerate_missing_rooter=yes "
-                "-- advertising routes without routing (the worker's rooter enforces them)",
-                e,
-            )
-            return
         if e.strerror == "No such file or directory":
             raise CuckooStartupError(
                 "The rooter is required but it is either not running or it "
@@ -762,15 +740,6 @@ def init_routing(apply_nexthop_state=False):
     # Check whether all VPNs exist if configured and make their configuration
     # available through the vpns variable. Also enable NAT on each interface.
 
-    # Central management/UI node (opted in via tolerate_missing_rooter): still populate the
-    # vpns/socks5s/gateways dicts so the submission form can advertise the fleet's routes, but SKIP
-    # every rooter round-trip (rt_available/nic_available verification + NAT setup). The UI never
-    # routes -- only workers do -- and it has no VPN infra (tun0), so those checks would raise
-    # CuckooStartupError ("routing table ... not available") when a rooter IS running, or TypeError
-    # on rooter(...)["output"] when none is, either way killing the UI at import. The worker's rooter
-    # does the real verification + routing (codex).
-    _skip_rooter = _tolerate_missing_rooter()
-
     if routing.socks5.enabled:
         for name in routing.socks5.proxies.split(","):
             name = name.strip()
@@ -793,22 +762,21 @@ def init_routing(apply_nexthop_state=False):
                 raise CuckooStartupError(f"Could not find VPN configuration for {name}")
 
             entry = routing.get(name)
-            if routing.routing.verify_rt_table and not _skip_rooter:
+            if routing.routing.verify_rt_table:
                 is_rt_available = rooter("rt_available", entry.rt_table)["output"]
                 if not is_rt_available:
                     raise CuckooStartupError(f"The routing table that has been configured for VPN {entry.name} is not available")
             vpns[entry.name] = entry
 
-            if not _skip_rooter:
-                # Disable & enable NAT on this network interface. Disable it just
-                # in case we still had the same rule from a previous run.
-                rooter("disable_nat", entry.interface)
-                rooter("enable_nat", entry.interface)
+            # Disable & enable NAT on this network interface. Disable it just
+            # in case we still had the same rule from a previous run.
+            rooter("disable_nat", entry.interface)
+            rooter("enable_nat", entry.interface)
 
-                # Populate routing table with entries from main routing table.
-                if routing.routing.auto_rt:
-                    rooter("flush_rttable", entry.rt_table)
-                    rooter("init_rttable", entry.rt_table, entry.interface)
+            # Populate routing table with entries from main routing table.
+            if routing.routing.auto_rt:
+                rooter("flush_rttable", entry.rt_table)
+                rooter("init_rttable", entry.rt_table, entry.interface)
 
     # Load [gwX] next-hop egress profiles; apply rooter state (sweep/build/arm) only for the scheduler
     # (no-op when [nexthop] absent/disabled).
@@ -822,7 +790,7 @@ def init_routing(apply_nexthop_state=False):
     validate_default_route(routing)
 
     # Check whether the dirty line exists if it has been defined.
-    if routing.routing.internet != "none" and not _skip_rooter:
+    if routing.routing.internet and str(routing.routing.internet).lower() not in ("none", "false"):
         is_nic_available = rooter("nic_available", routing.routing.internet)["output"]
         if not is_nic_available:
             raise CuckooStartupError("The network interface that has been configured as dirty line is not available")
@@ -849,7 +817,7 @@ def init_routing(apply_nexthop_state=False):
             rooter("init_rttable", routing.routing.rt_table, routing.routing.internet)
 
     # Check if tor interface exists, if yes then enable nat
-    if routing.tor.enabled and routing.tor.interface and not _skip_rooter:
+    if routing.tor.enabled and routing.tor.interface:
         is_nic_available = rooter("nic_available", routing.tor.interface)["output"]
         if not is_nic_available:
             raise CuckooStartupError("The network interface that has been configured as tor line is not available")
@@ -867,7 +835,7 @@ def init_routing(apply_nexthop_state=False):
     # Check if inetsim interface exists, if yes then enable nat, if interface is not the same as tor
     # if routing.inetsim.interface and cuckoo.routing.inetsim_interface !=  routing.tor.interface:
     # Check if inetsim interface exists, if yes then enable nat
-    if routing.inetsim.enabled and routing.inetsim.interface and not _skip_rooter:
+    if routing.inetsim.enabled and routing.inetsim.interface:
         is_nic_available = rooter("nic_available", routing.inetsim.interface)["output"]
         if not is_nic_available:
             raise CuckooStartupError("The network interface that has been configured as inetsim line is not available")

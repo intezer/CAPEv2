@@ -314,25 +314,6 @@ if OIDC_CFG is not None and OIDC_CFG.get("enabled", False):
         ],
     }
 
-
-def _users_app_present() -> bool:
-    """True iff the multi-tenant `users` app is deployed (its package dir exists).
-
-    The MT layer is import-optional: an upstream / central-only build simply omits
-    web/users/. This (drop the app from INSTALLED_APPS) and the tenancy_optional facades
-    (ImportError -> see-all) key off the SAME presence signal, so there is ONE source of
-    truth — no separate env flag that could diverge from the import-availability the facades
-    actually see (which previously left a flag-set-but-files-present build hitting non-migrated
-    tables). To run single-tenant WITH the files present, use `[multitenancy] enabled = no`
-    (the existing runtime toggle), not app removal.
-    """
-    return (BASE_DIR / "users").is_dir()
-
-
-# Drop the optional MT `users` app (and its migrations) when its package isn't deployed.
-if not _users_app_present():
-    INSTALLED_APPS = [a for a in INSTALLED_APPS if a != "users"]
-
 AUDIT_FRAMEWORK = web_cfg.audit_framework.get("enabled", False)
 
 if api_cfg.api.token_auth_enabled:
@@ -405,16 +386,39 @@ SETTINGS_EXPORT = [
     "HUNT_ENABLED"
 ]
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-if web_cfg.registration.get("email_confirmation", False):
-    EMAIL_HOST = web_cfg.registration.get("email_host", False)
-    EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
-    EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
-    EMAIL_PORT = web_cfg.registration.get("email_port", 465)
-    EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
-    EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
-    SERVER_EMAIL = EMAIL_HOST_USER
-    DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+import django
+
+if django.VERSION >= (6, 1):
+    _mailer_options = {"host": "localhost", "port": 25}
+    if web_cfg.registration.get("email_confirmation", False):
+        _email_user = web_cfg.registration.get("email_user", "") or ""
+        _mailer_options = {
+            "host": web_cfg.registration.get("email_host", "") or "localhost",
+            "username": _email_user,
+            "password": web_cfg.registration.get("email_password", "") or "",
+            "port": web_cfg.registration.get("email_port", 465),
+            "use_tls": bool(web_cfg.registration.get("use_tls", False)),
+            "use_ssl": bool(web_cfg.registration.get("use_ssl", False)),
+        }
+        SERVER_EMAIL = _email_user
+        DEFAULT_FROM_EMAIL = _email_user
+    MAILERS = {
+        "default": {
+            "BACKEND": "django.core.mail.backends.smtp.EmailBackend",
+            "OPTIONS": _mailer_options,
+        }
+    }
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    if web_cfg.registration.get("email_confirmation", False):
+        EMAIL_HOST = web_cfg.registration.get("email_host", False)
+        EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
+        EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
+        EMAIL_PORT = web_cfg.registration.get("email_port", 465)
+        EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
+        EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
+        SERVER_EMAIL = EMAIL_HOST_USER
+        DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 SITE_ID = 1
 
@@ -426,7 +430,13 @@ else:
     ACCOUNT_EMAIL_VERIFICATION = "none"
     SOCIALACCOUNT_EMAIL_VERIFICATION = ACCOUNT_EMAIL_VERIFICATION
 
-ACCOUNT_EMAIL_REQUIRED = web_cfg.registration.get("email_required", False)
+_email_signup_field = (
+    "email*"
+    if (web_cfg.registration.get("email_required", False) or web_cfg.registration.get("email_confirmation", False))
+    else "email"
+)
+ACCOUNT_LOGIN_METHODS = {"username"}
+ACCOUNT_SIGNUP_FIELDS = ["username*", _email_signup_field, "password1*", "password2*"]
 ACCOUNT_EMAIL_SUBJECT_PREFIX = web_cfg.registration.get("email_prefix_subject", False)
 ACCOUNT_RATE_LIMITS = {"login_failed": "3/m"}
 LOGIN_REDIRECT_URL = "/"
@@ -534,11 +544,22 @@ except NameError:
     with suppress(ImportError):
         from .local_settings import *  # noqa: F403
 
+from lib.cuckoo.common.hooks import bootstrap_tenancy  # noqa: E402
+
+bootstrap_tenancy(Config("cuckoo"), settings_globals=globals())
+
 from lib.cuckoo.core.database import init_database
 
 init_database()
 
-# Prevent Django's auto-reloader from watching/reloading when files inside workers/ folder change
+# Prevent Django's and Werkzeug's auto-reloader from scanning/watching files inside workers/ folder
+RUNSERVER_PLUS_EXCLUDE_PATTERNS = [*globals().get("RUNSERVER_PLUS_EXCLUDE_PATTERNS", []), "*/workers/*"]
+
+with suppress(ImportError):
+    from werkzeug import _reloader
+
+    _reloader._ignore_common_dirs.add("workers")
+
 from django.dispatch import receiver
 from django.utils.autoreload import file_changed
 

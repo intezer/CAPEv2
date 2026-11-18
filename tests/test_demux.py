@@ -11,6 +11,7 @@ import pytest
 from tcr_misc import get_sample
 
 from lib.cuckoo.common import demux
+from lib.cuckoo.common.config import AnalysisConfig, Config
 
 
 @pytest.fixture
@@ -196,4 +197,270 @@ class TestDemux:
         assert path != b""
         if os.path.exists(path):
             os.remove(path)
+
+    def test_junk_filter_defaults_match_web_conf(self):
+        assert demux.JunkFilter.from_config(Config("web").junk_filter) == demux.JunkFilter()
+        assert demux.JunkFilter.from_config({}) == demux.JunkFilter()
+        assert demux.JunkFilter.from_config(None) == demux.JunkFilter()
+
+    def test_junk_filter_from_config_overrides_present_keys(self, tmp_path):
+        junk_filter = demux.JunkFilter.from_config({"extensions": "", "names": " README , "})
+        assert junk_filter == demux.JunkFilter(extensions=(), names=(b"readme",))
+
+        normalized = demux.JunkFilter.from_config({"extensions": "md, .TXT", "paths": r".git\,.svn/"})
+        assert normalized.extensions == (b".md", b".txt")
+        assert normalized.paths == (b".git/", b".svn/")
+        assert normalized.match_name(b"systemd") is None
+        assert normalized.match_name(b"readme.md") == "extension: .md"
+
+        ini_path = tmp_path / "web.conf"
+        ini_path.write_text(
+            "[junk_filter]\n"
+            "enabled = yes\n"
+            "extensions = no\n"
+            "names = 123\n"
+            "paths = .git\\\n"
+            "magics = 0\n"
+        )
+        parsed = AnalysisConfig(str(ini_path))
+        coerced = demux.JunkFilter.from_config(parsed.junk_filter)
+        assert coerced == demux.JunkFilter(extensions=(), names=(b"123",), paths=(b".git/",), magics=())
+
+    def test_junk_filter_from_config_disabled(self):
+        assert demux.JunkFilter.from_config({"enabled": False}) == demux.JunkFilter(extensions=(), names=(), paths=(), magics=())
+        assert demux.JunkFilter.from_config({"enabled": 0}) == demux.JunkFilter(extensions=(), names=(), paths=(), magics=())
+
+    def test_demux_junk_filter_reports_rule_and_matches_basename(self, tmp_path):
+        license_file = tmp_path / "LicenseServer.exe"
+        license_file.write_text("MZ")
+        demuxed, errors = demux.demux_sample(filename=str(license_file), package=None, options="", use_sflock=False)
+        assert demuxed == []
+        assert "(name: license)" in errors[0]["junk_filter"]
+
+        sample_dir = tmp_path / "readme_files"
+        sample_dir.mkdir()
+        sample_file = sample_dir / "sample.exe"
+        sample_file.write_text("MZ")
+        demuxed, errors = demux.demux_sample(filename=str(sample_file), package=None, options="", use_sflock=False)
+        assert len(demuxed) == 1
+        assert errors == []
+
+        assert demux.junk_filter.match_name(b"readme_files\\sample.exe") is None
+        assert demux.junk_filter.match_name(b"readme_files\\LicenseServer.exe") == "name: license"
+        assert demux.junk_filter.match_name(None) is None
+
+    @pytest.mark.parametrize("name", ["LicenseServer.exe", "readme.txt", "Makefile.yml"])
+    def test_demux_junk_filter_content_only_accepts_named_files(self, tmp_path, monkeypatch, name):
+        monkeypatch.setattr(demux, "junk_filter", demux.JunkFilter(extensions=(), names=(), paths=()))
+        sample_file = tmp_path / name
+        sample_file.write_text("echo polyshell")
+
+        demuxed, errors = demux.demux_sample(filename=str(sample_file), package=None, options="", use_sflock=False)
+        assert len(demuxed) == 1
+        assert errors == []
+
+    @pytest.mark.parametrize(
+        ("relapath", "filename"),
+        [
+            (b"License.exe", b"License.exe"),
+            (b"readme.txt", b"readme.txt"),
+            (b".git/hooks/payload", b"payload"),
+        ],
+    )
+    def test_sf_children_content_only_extracts_pe_and_skips_pdb(self, tmp_path, monkeypatch, relapath, filename):
+        monkeypatch.setattr(demux, "tmp_path", str(tmp_path))
+        monkeypatch.setattr(demux, "junk_filter", demux.JunkFilter(extensions=(), names=(), paths=()))
+        pe_child = SimpleNamespace(
+            filename=filename,
+            relapath=relapath,
+            contents=b"MZ\x90\x00",
+            platform="windows",
+            magic="PE32 executable (GUI) Intel 80386, for MS Windows",
+            filesize=4,
+            package=None,
+        )
+        path, _, _, _ = demux._sf_children(pe_child, ignore_junk_filter=False)
+        assert path != b""
+        os.remove(path)
+
+        pdb_child = SimpleNamespace(**{**vars(pe_child), "magic": "MSVC program database ver 7.00"})
+        path, _, _, _ = demux._sf_children(pdb_child, ignore_junk_filter=False)
+        assert path == b""
+
+    @pytest.mark.parametrize(
+        ("relapath", "filename"),
+        [
+            (b".git/hooks/payload.exe", b"payload.exe"),
+            (b"repo\\.github\\workflows\\runner.exe", b"runner.exe"),
+        ],
+    )
+    def test_sf_children_junk_paths_matches_relapath(self, tmp_path, monkeypatch, relapath, filename):
+        monkeypatch.setattr(demux, "tmp_path", str(tmp_path))
+        child = SimpleNamespace(
+            filename=filename,
+            relapath=relapath,
+            contents=b"MZ\x90\x00",
+            platform="windows",
+            magic="PE32 executable (GUI) Intel 80386, for MS Windows",
+            filesize=4,
+            package=None,
+        )
+        for ignore in (False, True):
+            path, _, _, _ = demux._sf_children(child, ignore_junk_filter=ignore)
+            assert path == b""
+
+        if demux.HAS_SFLOCK and demux.sfFile:
+            real_child = demux.sfFile(relapath=relapath, contents=b"MZ\x90\x00")
+            assert real_child.filename == filename
+            for ignore in (False, True):
+                path, _, _, _ = demux._sf_children(real_child, ignore_junk_filter=ignore)
+                assert path == b""
+
+    def test_sf_children_handles_none_filename(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(demux, "tmp_path", str(tmp_path))
+        unnamed_pe = SimpleNamespace(
+            filename=None,
+            relapath=None,
+            contents=b"MZ\x90\x00",
+            platform="windows",
+            magic="PE32 executable (GUI) Intel 80386, for MS Windows",
+            filesize=4,
+            package=None,
+        )
+        path, _, _, _ = demux._sf_children(unnamed_pe, ignore_junk_filter=False)
+        assert path != b""
+        assert os.path.basename(path) == b"extracted"
+        assert open(path, "rb").read() == b"MZ\x90\x00"
+
+    def test_is_encrypted_office_magic_and_msoffcrypto(self, tmp_path, monkeypatch):
+        sample = tmp_path / "doc.bin"
+        sample.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+
+        assert demux._is_encrypted_office(str(sample).encode(), "CDFV2 Encrypted") is True
+        assert demux._is_encrypted_office(str(sample).encode(), "Composite Document File (Encrypted)") is True
+
+        ole_handle = SimpleNamespace(closed=False)
+        ole_handle.close = lambda: setattr(ole_handle, "closed", True)
+
+        class FakeOfficeFile:
+            def __init__(self, fp):
+                self.ole = ole_handle
+
+            def is_encrypted(self):
+                return True
+
+        monkeypatch.setattr(demux, "HAS_MSOFFCRYPTO", True)
+        monkeypatch.setattr(demux, "msoffcrypto", SimpleNamespace(OfficeFile=FakeOfficeFile))
+
+        assert demux._is_encrypted_office(str(sample).encode(), "Composite Document File V2 Document") is True
+        assert ole_handle.closed is True
+
+    def test_demux_office_password_candidates_without_verify_password(self, tmp_path, monkeypatch):
+        sample = tmp_path / "secret.doc"
+        sample.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32)
+        attempted_passwords = []
+        ole_handle = SimpleNamespace(closed=False)
+        ole_handle.close = lambda: setattr(ole_handle, "closed", True)
+
+        class FakeDoc97File:
+            def __init__(self, fp):
+                self.ole = ole_handle
+                self._pw = None
+
+            def is_encrypted(self):
+                return True
+
+            def load_key(self, password=None):
+                attempted_passwords.append(password)
+                self._pw = password
+
+            def decrypt(self, out_buf):
+                if self._pw != "VelvetSweatshop":
+                    raise ValueError("wrong password")
+                out_buf.write(b"decrypted-doc-bytes")
+
+        monkeypatch.setattr(demux, "tmp_path", str(tmp_path))
+        monkeypatch.setattr(demux, "HAS_MSOFFCRYPTO", True)
+        monkeypatch.setattr(demux, "HAS_SFLOCK", False)
+        monkeypatch.setattr(demux, "msoffcrypto", SimpleNamespace(OfficeFile=FakeDoc97File))
+
+        res = demux.demux_office(str(sample).encode(), "custompw", "windows")
+        assert attempted_passwords == ["custompw", "VelvetSweatshop"]
+        assert ole_handle.closed is True
+        assert len(res) == 1
+        out_path, plat = res[0]
+        assert plat == "windows"
+        assert os.path.basename(out_path) == b"secret.doc"
+        assert open(out_path, "rb").read() == b"decrypted-doc-bytes"
+
+        # Empty user password must try defaults in order ["VelvetSweatshop", "infected", ""]
+        attempted_passwords.clear()
+        res_empty = demux.demux_office(str(sample).encode(), "", "windows")
+        assert attempted_passwords == ["VelvetSweatshop"]
+        assert len(res_empty) == 1
+
+    def test_demux_office_sflock_fallback_and_missing_decryptor_error(self, tmp_path, monkeypatch):
+        sample = tmp_path / "encrypted.docx"
+        sample.write_bytes(b"encrypted-data")
+
+        class FakeSflockOffice:
+            def __init__(self, sf_obj):
+                self.sf_obj = sf_obj
+
+            def decrypt(self, password):
+                if password == "infected":
+                    return SimpleNamespace(contents=b"plain-docx-bytes", magic="Microsoft Word 2007+")
+                return SimpleNamespace(contents=b"", magic="CDFV2 Encrypted")
+
+        monkeypatch.setattr(demux, "tmp_path", str(tmp_path))
+        monkeypatch.setattr(demux, "HAS_MSOFFCRYPTO", False)
+        monkeypatch.setattr(demux, "HAS_SFLOCK", True)
+        monkeypatch.setattr(demux, "OfficeFile", FakeSflockOffice, raising=False)
+        monkeypatch.setattr(demux, "sfFile", SimpleNamespace(from_path=lambda p: p), raising=False)
+
+        res = demux.demux_office(str(sample).encode(), "", "windows")
+        assert len(res) == 1
+        assert open(res[0][0], "rb").read() == b"plain-docx-bytes"
+
+        monkeypatch.setattr(demux, "HAS_SFLOCK", False)
+        with pytest.raises(demux.CuckooDemuxError):
+            demux.demux_office(str(sample).encode(), "", "windows")
+
+    def test_demux_sample_unencrypted_and_encrypted_office(self, tmp_path, monkeypatch):
+        sample = tmp_path / "plain.docx"
+        sample.write_bytes(b"PK\x03\x04plain-office-content")
+
+        monkeypatch.setattr(demux.File, "get_type", lambda self: "Microsoft Word 2007+")
+        sflock_called = []
+        monkeypatch.setattr(demux, "demux_sflock", lambda *a, **k: sflock_called.append(True) or ([], "", []))
+
+        # Unencrypted Office passes directly even with HAS_MSOFFCRYPTO=False and HAS_SFLOCK=False
+        monkeypatch.setattr(demux, "HAS_MSOFFCRYPTO", False)
+        monkeypatch.setattr(demux, "HAS_SFLOCK", False)
+        demuxed, errors = demux.demux_sample(str(sample).encode(), package=None, options="", use_sflock=True, platform="windows")
+        assert demuxed == [(str(sample).encode(), "windows")]
+        assert errors == []
+        assert sflock_called == []
+
+        # Encrypted Office with use_sflock=True and no decryptor returns error
+        monkeypatch.setattr(demux.File, "get_type", lambda self: "CDFV2 Encrypted")
+        demuxed, errors = demux.demux_sample(str(sample).encode(), package=None, options="", use_sflock=True)
+        assert demuxed == []
+        assert errors
+
+        # Encrypted Office with use_sflock=True and decryptor delegates to demux_office
+        monkeypatch.setattr(demux, "HAS_MSOFFCRYPTO", True)
+        monkeypatch.setattr(
+            demux,
+            "demux_office",
+            lambda fn, pw, plat: [(b"/tmp/decrypted.docx", plat)],
+        )
+        demuxed, errors = demux.demux_sample(str(sample).encode(), package=None, options="password=infected", use_sflock=True, platform="windows")
+        assert demuxed == [(b"/tmp/decrypted.docx", "windows")]
+        assert errors == []
+
+        # Encrypted Office with use_sflock=False falls back to _prepare_file
+        demuxed, errors = demux.demux_sample(str(sample).encode(), package=None, options="password=infected", use_sflock=False, platform="windows")
+        assert demuxed == [(str(sample).encode(), "windows")]
+        assert errors == []
 

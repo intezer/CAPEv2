@@ -18,12 +18,12 @@ import xmlrpc.client
 import zipfile
 from datetime import datetime
 from io import BytesIO
-from typing import Final, List, Tuple, Union
+from typing import Final, List, Optional, Tuple, Union
 
 from data.family_detection_names import family_detection_names
 from lib.cuckoo.common import utils_dicts
 from lib.cuckoo.common import utils_pretty_print_funcs as pp_funcs
-from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.config import Config, _BaseConfig
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooOperationalError
 from lib.cuckoo.common.path_utils import path_exists, path_get_filename, path_is_dir, path_mkdir, path_read_file
@@ -251,6 +251,84 @@ def delete_folder(folder):
             shutil.rmtree(folder)
         except OSError as e:
             raise CuckooOperationalError(f"Unable to delete folder: {folder}") from e
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def get_files_storage_path(sha256: str) -> str:
+    """Return the path for a file in the sharded storage/files directory.
+    Checks flat legacy path first for backward compatibility.
+    """
+    sha256 = str(sha256).strip().lower()
+    if not _SHA256_HEX_RE.fullmatch(sha256):
+        raise ValueError(f"Invalid SHA256 digest: {sha256!r}")
+    flat_path = os.path.join(CUCKOO_ROOT, "storage", "files", sha256)
+    if os.path.exists(flat_path):
+        return flat_path
+    return os.path.join(CUCKOO_ROOT, "storage", "files", sha256[:2], sha256[2:4], sha256)
+
+
+def deduplicate_file_to_storage(src_path: str, sha256: str, dest_path: str = None) -> str:
+    """Atomically store a file in the sharded storage/files directory and replace dest_path with a symlink.
+
+    If dest_path is None, src_path is replaced in-place with a symlink to the sharded master file.
+    When the master file already exists, its timestamps are refreshed via os.utime so age-based
+    cleanup (files_clean_before) reflects the most recent analysis referencing the artifact.
+    """
+    if dest_path is None:
+        dest_path = src_path
+
+    master_path = get_files_storage_path(sha256)
+    if os.path.abspath(src_path) == os.path.abspath(master_path):
+        return master_path
+
+    files_storage_dir = os.path.dirname(master_path)
+
+    if not path_exists(master_path):
+        path_mkdir(files_storage_dir, exist_ok=True)
+        fd, tmp_master = tempfile.mkstemp(prefix=f".{sha256}.", dir=files_storage_dir)
+        os.close(fd)
+        try:
+            shutil.copy2(src_path, tmp_master)
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_master, 0o644)
+            os.replace(tmp_master, master_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_master)
+            raise
+    else:
+        with contextlib.suppress(OSError):
+            os.utime(master_path, None)
+
+    if src_path != dest_path and os.path.lexists(src_path):
+        with contextlib.suppress(OSError):
+            os.unlink(src_path)
+
+    if os.path.islink(dest_path) and os.readlink(dest_path) == master_path and path_exists(dest_path):
+        return master_path
+
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        path_mkdir(dest_dir, exist_ok=True)
+
+    tmp_link = f"{dest_path}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
+    try:
+        os.symlink(master_path, tmp_link)
+        os.replace(tmp_link, dest_path)
+    except (OSError, AttributeError):
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_link)
+        if os.path.lexists(dest_path):
+            with contextlib.suppress(OSError):
+                os.unlink(dest_path)
+        try:
+            os.symlink(master_path, dest_path)
+        except (OSError, AttributeError):
+            shutil.copy2(master_path, dest_path)
+
+    return master_path
 
 
 # Don't allow all characters in "string.printable", as newlines, carriage
@@ -626,6 +704,22 @@ def store_temp_file(filedata: bytes, filename: str, path=None) -> bytes:
 
     # ToDo consider change from bytes to str
     return tmp_file_path
+
+
+def get_cape_external_dir(tmppath: Optional[Union[str, bytes, os.PathLike]] = None) -> str:
+    """Return `<cuckoo.tmppath>/cape-external`, creating it if absent."""
+    base = tmppath
+    if base is None:
+        cfg_obj = Config() if isinstance(config, _BaseConfig) else config
+        base = cfg_obj.cuckoo.get("tmppath")
+    if isinstance(base, bytes):
+        base = base.decode("utf-8", errors="replace")
+    elif base is not None:
+        base = os.fspath(base)
+    base = (base or "/tmp").strip() or "/tmp"
+    ext_dir = os.path.join(base, "cape-external")
+    os.makedirs(ext_dir, exist_ok=True)
+    return ext_dir
 
 
 def add_family_detection(results: dict, family: str, detected_by: str, detected_on: str):
