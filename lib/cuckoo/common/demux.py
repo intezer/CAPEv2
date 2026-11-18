@@ -2,10 +2,13 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import contextlib
+import io
 import re
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
 from lib.cuckoo.common.config import Config
@@ -15,6 +18,14 @@ from lib.cuckoo.common.path_utils import path_exists, path_mkdir, path_write_fil
 from lib.cuckoo.common.quarantine import unquarantine
 from lib.cuckoo.common.trim_utils import trim_file, trimmed_path
 from lib.cuckoo.common.utils import get_options, option_enabled, sanitize_filename
+
+try:
+    import msoffcrypto
+
+    HAS_MSOFFCRYPTO = True
+except ImportError:
+    msoffcrypto = None
+    HAS_MSOFFCRYPTO = False
 
 sfFile = False
 try:
@@ -247,22 +258,76 @@ def options2passwd(options: str) -> str:
     return password
 
 
+def _is_encrypted_office(filename: bytes, magic: str) -> bool:
+    if "CDFV2 Encrypted" in magic or "Encrypted" in magic:
+        return True
+    if HAS_MSOFFCRYPTO:
+        with contextlib.suppress(Exception):
+            with open(filename, "rb") as f:
+                ms_file = msoffcrypto.OfficeFile(f)
+                try:
+                    return bool(ms_file.is_encrypted())
+                finally:
+                    ole = getattr(ms_file, "ole", None)
+                    if ole is not None:
+                        with contextlib.suppress(Exception):
+                            ole.close()
+    return False
+
+
 def demux_office(filename: bytes, password: str, platform: str) -> List[bytes]:
     retlist = []
     target_path = os.path.join(tmp_path, "cuckoo-tmp/msoffice-crypt-tmp")
     if not path_exists(target_path):
         path_mkdir(target_path)
-    decrypted_name = os.path.join(target_path, os.path.basename(filename).decode())
+    decrypted_name = os.path.join(target_path, os.path.basename(filename).decode(errors="replace"))
 
-    if HAS_SFLOCK:
-        ofile = OfficeFile(sfFile.from_path(filename))
-        d = ofile.decrypt(password)
-        # TODO: add decryption verification checks
-        if hasattr(d, "contents") and "Encrypted" not in d.magic:
-            _ = path_write_file(decrypted_name, d.contents)
-            retlist.append((decrypted_name.encode(), platform))
-    else:
+    if not (HAS_MSOFFCRYPTO or HAS_SFLOCK):
         raise CuckooDemuxError("MS Office decryptor not available")
+
+    candidates = ([password] if password else []) + ["VelvetSweatshop", "infected", ""]
+    passwords = list(dict.fromkeys(candidates))
+
+    decrypted_bytes = b""
+    if HAS_MSOFFCRYPTO:
+        with contextlib.suppress(Exception):
+            with open(filename, "rb") as f:
+                ms_file = msoffcrypto.OfficeFile(f)
+                try:
+                    if hasattr(ms_file, "is_encrypted") and not ms_file.is_encrypted():
+                        return [(filename, platform)]
+                    for pw in passwords:
+                        out_buf = io.BytesIO()
+                        try:
+                            ms_file.load_key(password=pw)
+                            ms_file.decrypt(out_buf)
+                            candidate_bytes = out_buf.getvalue()
+                            if candidate_bytes:
+                                decrypted_bytes = candidate_bytes
+                                break
+                        except Exception:
+                            continue
+                        finally:
+                            out_buf.close()
+                finally:
+                    ole = getattr(ms_file, "ole", None)
+                    if ole is not None:
+                        with contextlib.suppress(Exception):
+                            ole.close()
+
+    if decrypted_bytes:
+        _ = path_write_file(decrypted_name, decrypted_bytes)
+        retlist.append((decrypted_name.encode(), platform))
+    elif HAS_SFLOCK:
+        for pw in passwords:
+            with contextlib.suppress(Exception):
+                ofile = OfficeFile(sfFile.from_path(filename))
+                d = ofile.decrypt(pw)
+                # TODO: add decryption verification checks
+                if hasattr(d, "contents") and d.contents and "Encrypted" not in (d.magic or ""):
+                    _ = path_write_file(decrypted_name, d.contents)
+                    retlist.append((decrypted_name.encode(), platform))
+                    break
 
     if not retlist:
         retlist.append((filename, platform))
@@ -282,47 +347,101 @@ def is_valid_package(package: str) -> bool:
     return any(ptype in package for ptype in VALID_PACKAGES)
 
 
-# list of junk extensions to skip
-JUNK_EXTENSIONS = {
-    b".yar",
-    b".yara",
-    b".md",
-    b".txt",
-    b".yml",
-    b".yaml",
-    b".gitignore",
-    b".gitattributes",
-    b".gitmodules",
-    b".pdb",
-}
+def _split_list(value: Any) -> Tuple[str, ...]:
+    if value is None or isinstance(value, bool) or value == 0:
+        return ()
+    return tuple(item.strip() for item in str(value).split(",") if item.strip())
 
-JUNK_NAMES = {b"license", b"copying", b"makefile", b"authors", b"readme"}
 
-JUNK_MAGICS = (
-    "Microsoft Roslyn C# debugging symbols",
-    "MSVC program database",
-    "Microsoft C/C++ MSF",
-    "Microsoft C/C++ program database",
-)
+@dataclass(frozen=True)
+class JunkFilter:
+    """Rules for skipping junk files, from the [junk_filter] section of web.conf."""
+
+    extensions: Tuple[bytes, ...] = (
+        b".yar",
+        b".yara",
+        b".md",
+        b".txt",
+        b".yml",
+        b".yaml",
+        b".gitignore",
+        b".gitattributes",
+        b".gitmodules",
+        b".pdb",
+    )
+    names: Tuple[bytes, ...] = (b"license", b"copying", b"makefile", b"authors", b"readme")
+    paths: Tuple[bytes, ...] = (b".git/", b".github/")
+    magics: Tuple[str, ...] = (
+        "Microsoft Roslyn C# debugging symbols",
+        "MSVC program database",
+        "Microsoft C/C++ MSF",
+        "Microsoft C/C++ program database",
+    )
+
+    @classmethod
+    def from_config(cls, cfg: Optional[dict]) -> "JunkFilter":
+        """Build from the [junk_filter] section; missing keys keep the defaults, empty values disable that check."""
+        if cfg is None:
+            return cls()
+        if not cfg.get("enabled", True):
+            return cls(extensions=(), names=(), paths=(), magics=())
+        rules: Dict[str, Any] = {}
+        if "extensions" in cfg:
+            rules["extensions"] = tuple(
+                (item if item.startswith(".") else f".{item}").lower().encode()
+                for item in _split_list(cfg["extensions"])
+            )
+        if "names" in cfg:
+            rules["names"] = tuple(item.lower().encode() for item in _split_list(cfg["names"]))
+        if "paths" in cfg:
+            rules["paths"] = tuple(item.replace("\\", "/").lower().encode() for item in _split_list(cfg["paths"]))
+        if "magics" in cfg:
+            rules["magics"] = _split_list(cfg["magics"])
+        return cls(**rules)
+
+    def match_name(self, filename: Optional[bytes]) -> Optional[str]:
+        """Return the rule the file name matches, e.g. "name: license", or None."""
+        if not filename:
+            return None
+        basename = os.path.basename(filename.replace(b"\\", b"/").lower())
+        for extension in self.extensions:
+            if basename.endswith(extension):
+                return f"extension: {extension.decode('utf-8', errors='replace')}"
+        for name in self.names:
+            if name in basename:
+                return f"name: {name.decode('utf-8', errors='replace')}"
+        return None
+
+    def match_magic(self, magic: Optional[str]) -> Optional[str]:
+        """Return the rule the file type matches, e.g. "magic: MSVC program database", or None."""
+        for junk_magic in self.magics:
+            if magic and junk_magic in magic:
+                return f"magic: {junk_magic}"
+        return None
+
+    def is_junk_path(self, filename: Optional[bytes]) -> bool:
+        if not filename:
+            return False
+        normalized = filename.replace(b"\\", b"/").lower()
+        return any(path in normalized for path in self.paths)
+
+
+junk_filter = JunkFilter.from_config(getattr(web_cfg, "junk_filter", None))
 
 
 # ToDo fix return type
 def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, str, str, int]:
     path_to_extract = b""
-    filename_lower = child.filename.lower()
+    child_filename = child.filename or b""
+    child_relpath = getattr(child, "relapath", None) or child_filename
 
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
-    if not ignore_junk_filter:
-        if any(filename_lower.endswith(ext) for ext in JUNK_EXTENSIONS):
-            return b"", child.platform, child.magic, child.filesize
-        if any(name in filename_lower for name in JUNK_NAMES):
-            return b"", child.platform, child.magic, child.filesize
-        if child.magic and any(m in child.magic for m in JUNK_MAGICS):
-            return b"", child.platform, child.magic, child.filesize
-    if b".github/" in filename_lower or b".git/" in filename_lower:
+    if not ignore_junk_filter and (junk_filter.match_name(child_filename) or junk_filter.match_magic(child.magic)):
+        return b"", child.platform, child.magic, child.filesize
+    if junk_filter.is_junk_path(child_relpath):
         return b"", child.platform, child.magic, child.filesize
 
-    _, ext = os.path.splitext(child.filename)
+    _, ext = os.path.splitext(child_filename)
     ext = ext.lower()
     if (
         ignore_junk_filter
@@ -331,7 +450,7 @@ def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, s
         or is_valid_type(child.magic)
         or (not ext and is_valid_type(child.magic))
         # msix
-        or all([pattern in child.contents for pattern in (b"Registry.dat", b"AppxManifest.xml")])
+        or (child.contents and all([pattern in child.contents for pattern in (b"Registry.dat", b"AppxManifest.xml")]))
     ):
         target_path = os.path.join(tmp_path, "cuckoo-sflock")
         if not path_exists(target_path):
@@ -339,7 +458,8 @@ def _sf_children(child: Any, ignore_junk_filter: bool = False) -> Tuple[bytes, s
         tmp_dir = tempfile.mkdtemp(dir=target_path)
         try:
             if child.contents:
-                path_to_extract = os.path.join(tmp_dir, sanitize_filename((child.filename).decode())).encode()
+                safe_name = sanitize_filename((child_filename or b"extracted").decode("utf-8", errors="replace")) or "extracted"
+                path_to_extract = os.path.join(tmp_dir, safe_name).encode()
                 _ = path_write_file(path_to_extract, child.contents)
         except Exception as e:
             log.exception(e)
@@ -477,12 +597,9 @@ def demux_sample(
     # Skip junk files (unless analysis is forced via ignore_junk_filter option)
     if not option_enabled(options, "ignore_junk_filter"):
         filename_bytes = filename if isinstance(filename, bytes) else filename.encode()
-        filename_lower_bytes = filename_bytes.lower()
-        if any(filename_lower_bytes.endswith(ext) for ext in JUNK_EXTENSIONS) or any(
-            name in filename_lower_bytes for name in JUNK_NAMES
-        ):
+        if junk_rule := junk_filter.match_name(filename_bytes):
             filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
-            return [], [{"junk_filter": f"File {filename_str} skipped by junk filter"}]
+            return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
     # sflock requires filename to be bytes object for Py3
     # TODO: Remove after checking all uses of demux_sample use bytes ~TheMythologist
@@ -509,23 +626,35 @@ def demux_sample(
     # don't try to extract from office docs
     magic = File(filename).get_type() or ""
 
-    if not option_enabled(options, "ignore_junk_filter") and any(m in magic for m in JUNK_MAGICS):
+    if not option_enabled(options, "ignore_junk_filter") and (junk_rule := junk_filter.match_magic(magic)):
         filename_str = filename.decode(errors="ignore") if isinstance(filename, bytes) else filename
-        return [], [{"junk_filter": f"File {filename_str} skipped by junk filter"}]
+        return [], [{"junk_filter": f"File {filename_str} skipped by junk filter ({junk_rule})"}]
 
     # --- 3. Handle Password-Protected Office Files ---
     is_office = ("Microsoft" in magic or any(x in magic for x in OFFICE_TYPES)) and not any(x in magic for x in MS_EXCLUDE)
-    if is_office and use_sflock:
+    if is_office:
         password = options2passwd(options)
-        if use_sflock and password:
-            retlist = demux_office(filename, password, platform)
-            return retlist, error_list
-        # elif use_sflock:
-        #    retlist = demux_office(filename, "", platform)
-        #    return retlist, error_list
-        else:
-            log.error("Detected password protected office file, but no sflock is installed. Magic: %s, Password:%s", magic, str(password))
-            return [], [{os.path.basename(filename).decode(errors='ignore'): f"Detected password protected office file, but no sflock is installed. Magic: {magic}. Password: {password}"}]
+        if password or _is_encrypted_office(filename, magic):
+            if use_sflock and (HAS_MSOFFCRYPTO or HAS_SFLOCK):
+                retlist = demux_office(filename, password, platform)
+                return retlist, error_list
+            if use_sflock:
+                log.error(
+                    "Detected password protected office file, but no sflock is installed. Magic: %s, Password:%s",
+                    magic,
+                    str(password),
+                )
+                return [], [
+                    {
+                        os.path.basename(filename).decode(errors="ignore"): (
+                            f"Detected password protected office file, but no sflock is installed. Magic: {magic}. Password: {password}"
+                        )
+                    }
+                ]
+        valid_file, error = _prepare_file(filename, options)
+        if valid_file:
+            return [(valid_file, platform)], []
+        return [], [{os.path.basename(filename).decode(errors="ignore"): error}]
 
     # --- 4. Skip Extraction for specific types ---
     ignored_signatures = [

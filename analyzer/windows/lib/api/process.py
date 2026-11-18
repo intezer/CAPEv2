@@ -211,6 +211,7 @@ class Process:
         self.system_info = SYSTEM_INFO()
         self.critical = False
         self.path = None
+        self.last_error = None
 
     def __del__(self):
         """Close open handles."""
@@ -568,12 +569,14 @@ class Process:
                 "InitializeProcThreadAttributeList(size probe) unexpected result: ok=%s last_error=%d size=%d",
                 ok, last_error, cb_attribute_list_size.value
             )
+            return None, None, None
 
         attr_buf = create_string_buffer(cb_attribute_list_size.value)
         attr_list = cast(attr_buf, LPVOID)
 
         if not KERNEL32.InitializeProcThreadAttributeList(attr_list, 1, 0, byref(cb_attribute_list_size)):
             log.error("InitializeProcThreadAttributeList(init)")
+            return None, None, None
 
         hwnd = windll.user32.GetShellWindow()
         explorer_pid = DWORD()
@@ -583,6 +586,7 @@ class Process:
         if not raw_parent:
             KERNEL32.DeleteProcThreadAttributeList(attr_list)
             log.error("OpenProcess")
+            return None, None, None
 
         h_parent = HANDLE(raw_parent)
         if not KERNEL32.UpdateProcThreadAttribute(
@@ -597,6 +601,7 @@ class Process:
             KERNEL32.CloseHandle(h_parent)
             KERNEL32.DeleteProcThreadAttributeList(attr_list)
             log.error("UpdateProcThreadAttribute")
+            return None, None, None
 
         return attr_list, attr_buf, h_parent
 
@@ -667,8 +672,10 @@ class Process:
         )
         last_error = KERNEL32.GetLastError()
 
-        KERNEL32.CloseHandle(h_parent)
-        KERNEL32.DeleteProcThreadAttributeList(attr_list)
+        if h_parent:
+            KERNEL32.CloseHandle(h_parent)
+        if attr_list:
+            KERNEL32.DeleteProcThreadAttributeList(attr_list)
 
         if not created:
             log.warning(
@@ -699,6 +706,7 @@ class Process:
             self.h_process = process_info.hProcess
             self.thread_id = process_info.dwThreadId
             self.h_thread = process_info.hThread
+            self.last_error = None
             log.info('Successfully executed process from path "%s" with arguments "%s" with pid %d', path, args or "", self.pid)
             # self.log_process_tree(os.path.basename(path))
             if kernel_analysis:
@@ -706,11 +714,13 @@ class Process:
 
             return True
         else:
+            error_code = KERNEL32.GetLastError()
+            self.last_error = get_error_string(error_code)
             log.error(
                 'Failed to execute process from path "%s" with arguments "%s" (Error: %s)',
                 path,
                 args,
-                get_error_string(KERNEL32.GetLastError()),
+                self.last_error,
             )
             return False
 

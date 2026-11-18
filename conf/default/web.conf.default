@@ -52,8 +52,8 @@ search_limit = 50
 anon_viewable = no
 # If webgui response time is too long, you can disable existent_tasks and top_detections
 existent_tasks = no
-top_detections = yes
-top_asn = yes
+top_detections = no
+top_asn = no
 # Enable checking for samples in MongoDB before fetching from external sources. Disable to reduce MongoDB load when the database is large.
 check_sample_in_mongodb = no
 # hostname of the cape instance
@@ -78,6 +78,19 @@ url_splitter =
 # Limit number of files extracted from archive in demux.py
 demux_files_limit = 10
 public_searches = yes
+
+# Skip junk files (docs, repo metadata, debug symbols) on submission and archive extraction.
+# Lists are comma-separated; an empty value disables that check. ignore_junk_filter=1 bypasses all but paths per task.
+[junk_filter]
+enabled = yes
+# File extensions, case-insensitive (leading dot optional)
+extensions = .yar,.yara,.md,.txt,.yml,.yaml,.gitignore,.gitattributes,.gitmodules,.pdb
+# Substrings of the file name (basename), case-insensitive
+names = license,copying,makefile,authors,readme
+# Archive children whose path contains one of these are skipped
+paths = .git/,.github/
+# Substrings of the file type (libmagic), content-based (note: commas separate rules)
+magics = Microsoft Roslyn C# debugging symbols,MSVC program database,Microsoft C/C++ MSF,Microsoft C/C++ program database
 
 # ratelimit for anon users
 [ratelimit]
@@ -330,3 +343,14 @@ enabled = no
 [hunt]
 # Proactively discover new emerging campaigns by grouping undetected analyses by shared indicators
 enabled = no
+
+[static_preview]
+# Automatically run static analysis and config extraction on the submission status page
+# while waiting for dynamic VM execution to finish.
+enabled = no
+# When enabled = no, show an on-demand button on the status page so users can still
+# trigger static analysis preview manually if they change their mind.
+on_demand = yes
+# Allow users to stop dynamic VM execution early from the status page and finalize
+# the report with static analysis results.
+allow_stop = yes

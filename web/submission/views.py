@@ -8,15 +8,11 @@ import logging
 import os
 import random
 import sys
-import tempfile
 import textwrap
 from base64 import urlsafe_b64encode
 from contextlib import suppress
 
 from django.conf import settings
-
-from web.tenancy_optional import submission_scope, can_view_task, can_manage_task, can_view_sample, viewer_for
-from web.tenancy_optional import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render
 
@@ -24,7 +20,7 @@ sys.path.append(settings.CUCKOO_PATH)
 from uuid import NAMESPACE_DNS, uuid3
 
 from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
+from lib.cuckoo.common.path_utils import path_delete, path_exists
 from lib.cuckoo.common.saztopcap import saz_to_pcap
 from lib.cuckoo.common.utils import get_options, get_user_filename, sanitize_filename, store_temp_file
 from lib.cuckoo.common.web_utils import (
@@ -38,6 +34,7 @@ from lib.cuckoo.common.web_utils import (
     perform_search,
     process_new_dlnexec_task,
     process_new_task_files,
+    stop_analysis_task,
 )
 from lib.cuckoo.core.database import Database
 from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
@@ -52,34 +49,6 @@ aux_conf = Config("auxiliary")
 web_conf = Config("web")
 
 db = Database()
-
-
-def _scope_existent(request, records):
-    """Tenant isolation for the existent_tasks resubmit-by-hash display:
-    perform_search applies only the legacy TLP/public_searches filter, so in
-    locked mode it would surface other tenants' task id / sha256 / malware-family
-    for a known hash. Drop records the requester may not view — mirroring
-    analysis.search. No-op when MT disabled (can_view_task -> is_local_admin)."""
-    if not multitenancy_config().enabled:
-        # Upstream showed every search record verbatim (no per-task SQL-existence
-        # intersection). Return them unchanged so a record whose SQL Task was
-        # purged is still displayed = upstream byte-for-byte.
-        return records or []
-    out = []
-    for record in records or []:
-        if not isinstance(record, dict):
-            continue
-        rid = (record.get("info") or {}).get("id")
-        if rid is None:
-            continue
-        try:
-            vt = db.view_task(int(rid))
-        except (ValueError, TypeError):
-            continue
-        if vt is not None and can_view_task(request.user, vt):
-            out.append(record)
-    return out
-
 
 from urllib3 import disable_warnings
 
@@ -274,6 +243,77 @@ def get_form_data():
     return packages, machines
 
 
+_BATCH_TERMINAL_STATUSES = {
+    "reported",
+    "failed_analysis",
+    "failed_processing",
+    "failed_reporting",
+    "recovered",
+    "distributed_completed",
+}
+
+
+def _build_batch_tasks_info(request, task_ids):
+    """Build live status table rows and polling metadata for a batch of task IDs."""
+    rows = []
+    if not task_ids:
+        return rows, True
+
+    all_terminal = True
+    for raw_id in task_ids:
+        try:
+            tid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+
+        task = None
+        with suppress(Exception):
+            from sqlalchemy import select
+
+            from lib.cuckoo.common.hooks import apply_sql_task_filter
+            from lib.cuckoo.core.data.task import Task
+
+            base_stmt = select(Task).where(Task.id == tid)
+            filtered_stmt = apply_sql_task_filter(base_stmt)
+            if filtered_stmt is not base_stmt:
+                with db.session.begin():
+                    task_row = db.session.scalars(filtered_stmt).first()
+                if task_row:
+                    task = task_row.to_dict()
+            else:
+                task_obj = db.view_task(tid, details=True)
+                if task_obj:
+                    task = task_obj.to_dict() if hasattr(task_obj, "to_dict") else task_obj
+
+        if not task:
+            continue
+
+        raw_status = str(task.get("status", "pending"))
+        status = "processing" if raw_status == "completed" else raw_status
+        target = task.get("target") or ""
+        sample = task.get("sample") or {}
+        sha256 = sample.get("sha256", "") if isinstance(sample, dict) else getattr(sample, "sha256", "")
+        is_reported = raw_status in {"reported", "distributed_completed"}
+        is_terminal = raw_status in _BATCH_TERMINAL_STATUSES
+        if not is_terminal:
+            all_terminal = False
+
+        rows.append(
+            {
+                "id": tid,
+                "target": os.path.basename(target) if target and task.get("category") == "file" else target,
+                "full_target": target,
+                "category": task.get("category", "file"),
+                "status": status,
+                "sha256": sha256,
+                "is_reported": is_reported,
+                "is_terminal": is_terminal,
+            }
+        )
+
+    return rows, all_terminal
+
+
 # Conditional decorator for web authentication
 class conditional_login_required:
     def __init__(self, dec, condition):
@@ -286,25 +326,93 @@ class conditional_login_required:
         return self.decorator(func)
 
 
-def force_int(value):
-    try:
-        value = int(value)
-    except Exception:
-        value = 0
-    finally:
-        return value
+def _resolve_submission_target(request):
+    """Resolve (task_category, samples) from POST/FILES, honoring active_tab when provided
+    so stale inputs in inactive tabs do not override the user's selected tab."""
+    active_tab = (request.POST.get("active_tab") or "").strip().lstrip("#").lower()
+
+    def _get_resubmit():
+        val = (request.POST.get("hash") or "").strip()
+        return ("resubmit", val.split(",")) if val else (False, [])
+
+    def _get_sample():
+        return ("sample", request.FILES.getlist("sample")) if "sample" in request.FILES else (False, [])
+
+    def _get_static():
+        return ("static", request.FILES.getlist("static")) if "static" in request.FILES else (False, [])
+
+    def _get_pcap():
+        return ("pcap", request.FILES.getlist("pcap")) if "pcap" in request.FILES else (False, [])
+
+    def _get_url():
+        val = (request.POST.get("url") or "").strip()
+        return ("url", val) if val else (False, [])
+
+    def _get_dlnexec():
+        val = (request.POST.get("dlnexec") or "").strip()
+        return ("dlnexec", val) if val else (False, [])
+
+    def _get_downloading_service():
+        val = (request.POST.get("hashes") or "").strip()
+        return ("downloading_service", val) if val else (False, [])
+
+    tab_resolvers = {
+        "resubmit": _get_resubmit,
+        "file": _get_sample,
+        "sample": _get_sample,
+        "static": _get_static,
+        "pcap": _get_pcap,
+        "url": _get_url,
+        "dlurl": _get_dlnexec,
+        "dlnexec": _get_dlnexec,
+        "downloading_service": _get_downloading_service,
+        "hashes": _get_downloading_service,
+    }
+
+    if active_tab in tab_resolvers:
+        return tab_resolvers[active_tab]()
+
+    for resolver in (
+        _get_resubmit,
+        _get_sample,
+        _get_static,
+        _get_pcap,
+        _get_url,
+        _get_dlnexec,
+        _get_downloading_service,
+    ):
+        task_category, samples = resolver()
+        if task_category:
+            return task_category, samples
+    return False, []
+
+
+def _lookup_precheck_existent_tasks(request, raw_hashes: str) -> dict:
+    existent_tasks = {}
+    if not raw_hashes or not web_conf.general.get("existent_tasks", False):
+        return existent_tasks
+    candidates = [h.strip().lower() for h in raw_hashes.split(",") if h.strip()]
+    seen = set()
+    for sha256 in candidates[:10]:
+        if sha256 in seen or len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+            continue
+        seen.add(sha256)
+        with suppress(Exception):
+            records = perform_search("target_sha256", sha256, search_limit=5)
+            for record in records or []:
+                rec_sha = record.get("target", {}).get("file", {}).get("sha256") or sha256
+                existent_tasks.setdefault(rec_sha, []).append(record)
+    return existent_tasks
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request, task_id=None, resubmit_hash=None):
+    if request.method != "POST" and "precheck_sha256" in request.GET:
+        existent_tasks = _lookup_precheck_existent_tasks(request, request.GET.get("precheck_sha256", ""))
+        return render(request, "submission/_existent_tasks.html", {"existent_tasks": existent_tasks})
+
     remote_console = False
     if request.method == "POST":
-        try:
-            _tenant_id, _visibility = submission_scope(request)
-        except ValueError:
-            # Client input validation failure -> 400 (machine-detectable), per the
-            # submission_scope() contract that the view turns the bad value into a 400.
-            return render(request, "error.html", {"error": "Invalid visibility value"}, status=400)
         (
             static,
             package,
@@ -424,8 +532,6 @@ def index(request, task_id=None, resubmit_hash=None):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
-            "tenant_id": _tenant_id,
-            "visibility": _visibility,
             "package": package,
         }
         if opt_apikey:
@@ -443,29 +549,7 @@ def index(request, task_id=None, resubmit_hash=None):
             details["during_script_content"] = during_script.read()
             during_script.close()
 
-        task_category = False
-        samples = []
-        if "hash" in request.POST and request.POST.get("hash", False) and request.POST.get("hash")[0] != "":
-            task_category = "resubmit"
-            samples = request.POST.get("hash").strip().split(",")
-        elif "sample" in request.FILES:
-            task_category = "sample"
-            samples = request.FILES.getlist("sample")
-        elif "static" in request.FILES:
-            task_category = "static"
-            samples = request.FILES.getlist("static")
-        elif "pcap" in request.FILES:
-            task_category = "pcap"
-            samples = request.FILES.getlist("pcap")
-        elif "url" in request.POST and request.POST.get("url").strip():
-            task_category = "url"
-            samples = request.POST.get("url").strip()
-        elif "dlnexec" in request.POST and request.POST.get("dlnexec").strip():
-            task_category = "dlnexec"
-            samples = request.POST.get("dlnexec").strip()
-        elif "hashes" in request.POST and request.POST.get("hashes", False) and request.POST.get("hashes")[0] != "":
-            task_category = "downloading_service"
-            samples = request.POST.get("hashes").strip()
+        task_category, samples = _resolve_submission_target(request)
         list_of_tasks = []
         if task_category in ("url", "dlnexec"):
             if not samples:
@@ -487,23 +571,8 @@ def index(request, task_id=None, resubmit_hash=None):
             for hash in samples:
                 paths = []
                 if len(hash) in (32, 40, 64):
-                    # by-hash resubmit hits the global content-addressed store —
-                    # enforce the visible-task-referencing-the-sample boundary
-                    # before touching it, else a tenant exfiltrates another
-                    # tenant's sample bytes AND gets a full fresh analysis they
-                    # own. Deny path is byte-identical to genuinely-missing.
-                    _kw = {"sha256": hash} if len(hash) == 64 else ({"sha1": hash} if len(hash) == 40 else {"md5": hash})
-                    if not can_view_sample(request.user, **_kw):
-                        details["errors"].append({hash: "File not found on hdd for resubmission"})
-                        continue
                     paths = db.sample_path_by_hash(hash)
                 else:
-                    # task_id-based resubmit: the submit view is not task-gated,
-                    # so authorize the source task before reading its binary.
-                    _src = db.view_task(task_id)
-                    if _src is None or not can_view_task(request.user, _src):
-                        details["errors"].append({hash: "Task not found for resubmission"})
-                        continue
                     task_binary = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), "binary")
                     if path_exists(task_binary):
                         paths.append(task_binary)
@@ -544,25 +613,16 @@ def index(request, task_id=None, resubmit_hash=None):
                 if not content:
                     details["errors"].append({hash: f"Can't find {hash} on disk"})
                     continue
-                folder = os.path.join(settings.TEMP_PATH, "cape-resubmit")
-                if not path_exists(folder):
-                    path_mkdir(folder)
-                base_dir = tempfile.mkdtemp(prefix="resubmit_", dir=folder)
                 if opt_filename:
-                    filename = base_dir + "/" + opt_filename
+                    filename = opt_filename
                 else:
-                    # Try to recover the original filename from the task. This runs
-                    # for the by-HASH branch too, where the route task_id is NOT
-                    # can_view_task-gated — so require read access before trusting it,
-                    # else a by-hash resubmit carrying another tenant's task_id in the
-                    # URL would leak that hidden task's target basename into the new
-                    # submission. No read access -> fall back to the hash.
+                    # Try to recover the original filename from the task
                     original_filename = ""
                     if task_id:
                         task = db.view_task(task_id)
-                        if task and task.target and can_view_task(request.user, task):
+                        if task and task.target:
                             original_filename = sanitize_filename(os.path.basename(task.target))
-                    filename = base_dir + "/" + (original_filename or sanitize_filename(hash))
+                    filename = original_filename or sanitize_filename(hash)
                 path = store_temp_file(content, filename)
                 list_of_tasks.append((content, path, hash))
 
@@ -582,7 +642,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
-                        records = _scope_existent(request, perform_search("target_sha256", hash, search_limit=5, viewer=viewer_for(request.user)))
+                        records = perform_search("target_sha256", hash, search_limit=5)
                         if records:
                             for record in records or []:
                                 existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
@@ -603,7 +663,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.general.get("existent_tasks", False):
-                        records = _scope_existent(request, perform_search("target_sha256", sha256, search_limit=5, viewer=viewer_for(request.user)))
+                        records = perform_search("target_sha256", sha256, search_limit=5)
                         if records:
                             for record in records:
                                 if record.get("target").get("file", {}).get("sha256"):
@@ -611,7 +671,7 @@ def index(request, task_id=None, resubmit_hash=None):
 
         elif task_category == "static":
             for content, path, sha256 in list_of_tasks:
-                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
+                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0)
                 if not task_id:
                     return render(request, "error.html", {"error": "We don't have static extractor for this"})
                 details["task_ids"] += task_id
@@ -622,14 +682,16 @@ def index(request, task_id=None, resubmit_hash=None):
                     saz = saz_to_pcap(path)
                     if saz:
                         with suppress(Exception):
+                            parent_dir = os.path.dirname(path)
                             path_delete(path)
+                            with suppress(OSError):
+                                os.rmdir(parent_dir)
                         path = saz
                     else:
                         details["errors"].append({os.path.basename(path): "Conversion from SAZ to PCAP failed."})
                         continue
 
-                task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0,
-                                      tenant_id=_tenant_id, visibility=_visibility)
+                task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0)
                 if task_id:
                     details["task_ids"].append(task_id)
 
@@ -667,8 +729,6 @@ def index(request, task_id=None, resubmit_hash=None):
                         cape=cape,
                         tags_tasks=tags_tasks,
                         user_id=request.user.id or 0,
-                        tenant_id=_tenant_id,
-                        visibility=_visibility,
                     )
                     details["task_ids"].append(task_id)
 
@@ -687,9 +747,6 @@ def index(request, task_id=None, resubmit_hash=None):
                         details["errors"].extend(tasks_details["errors"])
 
         elif task_category == "downloading_service":
-            # viewer gates local-cache reuse inside download_from_3rdparty (no
-            # cross-tenant bytes via a "Local" hit). No-op when MT disabled.
-            details["viewer"] = viewer_for(request.user)
             details = download_from_3rdparty(samples, opt_filename, details)
 
         if details.get("task_ids"):
@@ -697,6 +754,8 @@ def index(request, task_id=None, resubmit_hash=None):
         else:
             tasks_count = 0
         if tasks_count > 0:
+            if tasks_count == 1 and not details.get("errors"):
+                return redirect("submission_status", task_id=details["task_ids"][0])
             data = {
                 "title": "Submission",
                 "tasks": details["task_ids"],
@@ -705,6 +764,10 @@ def index(request, task_id=None, resubmit_hash=None):
                 "existent_tasks": existent_tasks,
                 "remote_console": remote_console,
             }
+            task_rows, all_terminal = _build_batch_tasks_info(request, details["task_ids"])
+            data["task_rows"] = task_rows
+            data["batch_tasks_csv"] = ",".join(str(row["id"]) for row in task_rows)
+            data["all_terminal"] = all_terminal
             return render(request, "submission/complete.html", data)
         else:
             err_data = {
@@ -714,6 +777,20 @@ def index(request, task_id=None, resubmit_hash=None):
             }
             return render(request, "error.html", err_data)
     else:
+        if "batch_tasks" in request.GET:
+            raw_ids = [part.strip() for part in request.GET.get("batch_tasks", "").split(",") if part.strip().isdigit()][:50]
+            task_rows, all_terminal = _build_batch_tasks_info(request, raw_ids)
+            return render(
+                request,
+                "submission/_batch_tasks_table.html",
+                {
+                    "task_rows": task_rows,
+                    "batch_tasks_csv": ",".join(str(row["id"]) for row in task_rows),
+                    "all_terminal": all_terminal,
+                    "remote_console": request.GET.get("remote_console") == "1",
+                },
+            )
+
         enabledconf = {}
         enabledconf["kernel"] = settings.OPT_ZER0M0N
         enabledconf["memory"] = processing.memory.get("enabled")
@@ -819,40 +896,17 @@ def index(request, task_id=None, resubmit_hash=None):
         existent_tasks = {}
         if resubmit_hash:
             if web_conf.general.get("existent_tasks", False):
-                records = _scope_existent(request, perform_search("target_sha256", resubmit_hash, search_limit=5, viewer=viewer_for(request.user)))
+                records = perform_search("target_sha256", resubmit_hash, search_limit=5)
                 if records:
                     for record in records:
                         existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
                         existent_tasks[record["target"]["file"]["sha256"]].append(record)
 
-        # Visibility control is a MT-only addition. When MT is disabled, leave the
-        # context keys empty so the template "{% if visibility_levels %}" block
-        # collapses = upstream byte-for-byte (no new <select> rendered, and the
-        # value would be ignored by submission_scope anyway).
-        _visibility_levels = []
-        _form_default_visibility = None
-        if multitenancy_config().enabled:
-            # Offer TENANT iff the submitter actually has a tenant — this matches
-            # submission_scope, which honors an explicit 'tenant' for a tenant member (in
-            # BOTH modes) and rejects it for a tenant-less user. The default must also be
-            # a level that is actually OFFERED and must match what submission_scope would
-            # persist for an unchanged form: a tenant-less user in locked mode resolves to
-            # 'tenant' (not offered), so the browser would select the first option (public)
-            # and submit it explicitly — bypassing submission_scope's fail-closed private
-            # downgrade. Downgrade that default to PRIVATE here to keep the two in sync.
-            _sub_viewer = viewer_for(request.user)
-            _has_tenant = _sub_viewer.tenant_id is not None
-            _visibility_levels = [PUBLIC, TENANT, PRIVATE] if _has_tenant else [PUBLIC, PRIVATE]
-            _form_default_visibility = default_visibility(multitenancy_config())
-            if _form_default_visibility == TENANT and not _has_tenant:
-                _form_default_visibility = PRIVATE
-        return render(
-            request,
-            "submission/index.html",
+        from lib.cuckoo.common.hooks import apply_submission_context_filter
+
+        submission_ctx = apply_submission_context_filter(
             {
                 "title": "Submit",
-                "visibility_levels": _visibility_levels,
-                "default_visibility": _form_default_visibility,
                 "packages": sorted(packages, key=lambda i: i["name"].lower()),
                 "machines": machines,
                 "vpns": vpns_data,
@@ -869,17 +923,124 @@ def index(request, task_id=None, resubmit_hash=None):
                 "tags": all_vms_tags,
                 "existent_tasks": existent_tasks,
                 "all_exitnodes": list(sorted(load_vms_exits())),
-            },
+            }
         )
+        return render(
+            request,
+            "submission/index.html",
+            submission_ctx,
+        )
+
+
+def _lookup_existent_tasks(request, sha256: str, current_task_id: int) -> dict:
+    existent_tasks = {}
+    if not sha256 or not web_conf.general.get("existent_tasks", False):
+        return existent_tasks
+    with suppress(Exception):
+        records = perform_search("target_sha256", sha256, search_limit=5)
+        for record in records or []:
+            rid = (record.get("info") or {}).get("id")
+            if rid is not None and int(rid) == int(current_task_id):
+                continue
+            rec_sha = record.get("target", {}).get("file", {}).get("sha256") or sha256
+            existent_tasks.setdefault(rec_sha, []).append(record)
+    return existent_tasks
+
+
+def _format_elapsed_duration(task) -> str:
+    from lib.cuckoo.core.data.db_common import _utcnow_naive
+
+    raw_status = getattr(task, "status", "")
+    if raw_status == "running":
+        ref_dt = getattr(task, "started_on", None) or getattr(task, "added_on", None)
+    elif raw_status == "completed":
+        ref_dt = getattr(task, "completed_on", None) or getattr(task, "started_on", None) or getattr(task, "added_on", None)
+    else:
+        ref_dt = getattr(task, "added_on", None)
+
+    if not ref_dt:
+        return ""
+    try:
+        total_seconds = max(0, int((_utcnow_naive() - ref_dt).total_seconds()))
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        if minutes > 0:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+    except Exception:
+        return ""
+
+
+def _get_queue_position(request, task) -> int | None:
+    if getattr(task, "status", "") != "pending":
+        return None
+    with suppress(Exception):
+        from sqlalchemy import and_, func, or_, select
+        from lib.cuckoo.core.data.task import TASK_PENDING, Task
+        from lib.cuckoo.common.hooks import apply_sql_task_filter
+
+        prio = getattr(task, "priority", 1) or 1
+        tid = int(task.id)
+        stmt = (
+            select(func.count(Task.id))
+            .where(Task.status == TASK_PENDING)
+            .where(or_(Task.priority > prio, and_(Task.priority == prio, Task.id < tid)))
+        )
+        stmt = apply_sql_task_filter(stmt)
+        with db.session.begin():
+            ahead = db.session.scalar(stmt) or 0
+        return int(ahead) + 1
+    return None
+
+
+def _get_static_preview_settings():
+    cfg_section = getattr(web_conf, "static_preview", None)
+    if cfg_section is not None and hasattr(cfg_section, "get"):
+        enabled = bool(cfg_section.get("enabled", False))
+        on_demand = bool(cfg_section.get("on_demand", True))
+        allow_stop = bool(cfg_section.get("allow_stop", True))
+    else:
+        enabled = False
+        on_demand = True
+        allow_stop = True
+    return enabled, on_demand, allow_stop
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def status(request, task_id):
+    from django.http import HttpResponseForbidden
+
+    from submission.static_preview import get_static_preview
+
     task = db.view_task(task_id)
-    # tenant isolation: hidden == missing. The status body is a READ (can_view_task);
-    # the live-VM guac session_data is emitted only to a MANAGER below.
-    if not task or not can_view_task(request.user, task):
+    if not task:
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
+
+    static_preview_enabled, static_preview_on_demand, allow_stop_analysis = _get_static_preview_settings()
+    stop_requested = False
+
+    if request.method == "POST":
+        action = request.POST.get("action", "stop")
+        if action == "stop":
+            if not allow_stop_analysis:
+                return HttpResponseForbidden("Stopping analysis is disabled.")
+            stop_res = stop_analysis_task(task_id, mode="stop")
+            if not stop_res.get("error"):
+                stop_requested = True
+            task = db.view_task(task_id) or task
+
+    if request.GET.get("static") == "1":
+        if not (static_preview_enabled or static_preview_on_demand):
+            return HttpResponseForbidden("Static preview is disabled.")
+        preview = get_static_preview(task, run_full=True) or {}
+        sha256 = preview.get("file", {}).get("sha256", "")
+        preview["task_id"] = task_id
+        preview["task_status"] = task.status
+        preview["allow_stop_analysis"] = allow_stop_analysis and task.status in ("pending", "running", "distributed")
+        preview["existent_tasks"] = _lookup_existent_tasks(request, sha256, task_id)
+        return render(request, "submission/_static_preview.html", preview)
 
     completed = False
     if task.status == "reported":
@@ -892,37 +1053,48 @@ def status(request, task_id):
     if status == "completed":
         status = "processing"
 
+    if status == "running" and not stop_requested:
+        with suppress(Exception):
+            if db.guest_get_status(task_id) == "stopping":
+                stop_requested = True
+
+    interactive = bool(web_conf.guacamole.enabled and get_options(task.options).get("interactive") == "1")
+    can_stop = bool(allow_stop_analysis and status in ("pending", "running", "distributed") and not stop_requested)
+    has_static_target = getattr(task, "category", "") != "url" and (
+        getattr(task, "category", "") in ("file", "static", "archive") or bool(getattr(task, "sample", None))
+    )
+
     response = {
         "title": "Task Status",
         "completed": completed,
         "status": status,
         "task_id": task_id,
+        "interactive": interactive,
         "session_data": "",
+        "queue_position": _get_queue_position(request, task) if not completed else None,
+        "elapsed_time": _format_elapsed_duration(task) if not completed else "",
         "target": task.sample.sha256 if getattr(task, "sample") else task.target,
+        "static_preview_enabled": static_preview_enabled and has_static_target,
+        "static_preview_on_demand": static_preview_on_demand and has_static_target,
+        "allow_stop_analysis": can_stop,
+        "stop_requested": stop_requested,
+        "task_status": task.status,
     }
-    # Live-VM session token: only for a caller who may MANAGE the task (owner /
-    # tenant-admin / break-glass). A read-only viewer sees status but no session_data,
-    # so they can't drive another user's/tenant's live VM.
-    if web_conf.guacamole.enabled and get_options(task.options).get("interactive") == "1" and can_manage_task(request.user, task):
+    if interactive and task.status == "running" and not stop_requested:
         machine = db.view_machine_by_label(task.machine) if task.machine else None
-        vm_label, guest_ip = (task.machine, machine.ip) if machine else (None, None)
-        if not machine:
-            # Central mode ONLY: the VM lives on a worker, so it's not in the central machines
-            # table — resolve the worker's VM label via the broker record + worker API. Gated on
-            # central mode so single-node behaves exactly as upstream (no session_data unless a
-            # real machine record resolved — never a degenerate empty-guest_ip session).
-            from lib.cuckoo.common.central_mode import central_mode_config
-
-            if central_mode_config().enabled:
-                from lib.cuckoo.common.central_guac import worker_vm_for_task
-
-                w_label, w_ip = worker_vm_for_task(task_id)
-                if w_label:
-                    vm_label, guest_ip = w_label, (w_ip or "")
-        if vm_label:
+        if machine:
+            guest_ip = machine.ip
             session_id = uuid3(NAMESPACE_DNS, str(task_id)).hex[:16]
-            session_data = urlsafe_b64encode(f"{session_id}|{vm_label}|{guest_ip or ''}".encode("utf8")).decode("utf8")
+            session_data = urlsafe_b64encode(f"{session_id}|{task.machine}|{guest_ip}".encode("utf8")).decode("utf8")
             response["session_data"] = session_data
+
+    # Populate instant Tier-1 static file info on initial page load when enabled (skipped during 5s HTMX #status-card polls).
+    if not request.headers.get("HX-Request") and static_preview_enabled:
+        preview = get_static_preview(task, run_full=False)
+        if preview:
+            response.update(preview)
+            sha256 = preview.get("file", {}).get("sha256", "")
+            response["existent_tasks"] = _lookup_existent_tasks(request, sha256, task_id)
 
     return render(request, "submission/status.html", response)
 
@@ -930,35 +1102,20 @@ def status(request, task_id):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def remote_session(request, task_id):
     task = db.view_task(task_id)
-    # This endpoint exists only to mint the live-VM guac session_data, i.e. keyboard/
-    # mouse/framebuffer control — a task ACTION. Gate it on can_manage_task (owner /
-    # tenant-admin / break-glass), not read visibility; hidden == missing.
-    if not task or not can_manage_task(request.user, task):
+    if not task:
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
     machine_status = False
     session_data = ""
 
     if task.status == "running":
-        machine = db.view_machine_by_label(task.machine) if task.machine else None
-        vm_label, guest_ip = (machine.label, machine.ip) if machine else (None, None)
+        machine = db.view_machine_by_label(task.machine)
         if not machine:
-            # Central mode ONLY: the VM lives on a worker (not in the central machines table) —
-            # resolve it via the broker record + worker API. Gated on central mode so single-node
-            # is byte-for-byte upstream: no machine record -> the "Machine is not set" error below.
-            from lib.cuckoo.common.central_mode import central_mode_config
-
-            if central_mode_config().enabled:
-                from lib.cuckoo.common.central_guac import worker_vm_for_task
-
-                w_label, w_ip = worker_vm_for_task(task_id)
-                if w_label:
-                    vm_label, guest_ip = w_label, (w_ip or "")
-        if not vm_label:
             return render(request, "error.html", {"error": "Machine is not set for this task."})
+        guest_ip = machine.ip
         machine_status = True
         session_id = uuid3(NAMESPACE_DNS, str(task_id)).hex[:16]
-        session_data = urlsafe_b64encode(f"{session_id}|{vm_label}|{guest_ip or ''}".encode("utf8")).decode("utf8")
+        session_data = urlsafe_b64encode(f"{session_id}|{machine.label}|{guest_ip}".encode("utf8")).decode("utf8")
 
     return render(
         request,

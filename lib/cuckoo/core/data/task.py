@@ -21,6 +21,7 @@ try:
         Integer,
         String,
         Text,
+        event,
     )
     from sqlalchemy.types import JSON
 except ImportError:  # pragma: no cover
@@ -141,13 +142,6 @@ class Task(Base):
 
     tlp: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     user_id: Mapped[Optional[int]] = mapped_column(nullable=True)
-    # index=True so a FRESH install (schema via Base.metadata.create_all(), which skips Alembic)
-    # gets ix_tasks_tenant_id too — the migration (3_add_tenant_visibility) creates it on MIGRATED
-    # installs, so without this the tenant-scoped list_tasks/count_* filters seq-scan on fresh MT
-    # installs. SQLAlchemy's default name (ix_tasks_tenant_id) matches the migration's, so the two
-    # provisioning paths converge.
-    tenant_id: Mapped[Optional[int]] = mapped_column(nullable=True, index=True)
-    visibility: Mapped[str] = mapped_column(String(16), nullable=False, server_default="private")
     attributes: Mapped[Optional[dict]] = mapped_column(
         MutableDict.as_mutable(JSON().with_variant(JSONB(), "postgresql")),
         nullable=True,
@@ -186,17 +180,44 @@ class Task(Base):
         """
         return json.dumps(self.to_dict())
 
+    @property
+    def main_task_id(self) -> Optional[int]:
+        """Return positive integer main_task_id from task attributes, if set."""
+        val = self.get_attribute("main_task_id")
+        if val is None or isinstance(val, bool):
+            return None
+        try:
+            parsed = int(val)
+            return parsed if parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def task_label(self) -> str:
+        """Return '<id> (<main_task_id>)' when main_task_id is set, else '<id>'."""
+        mtid = self.main_task_id
+        return f"{self.id} ({mtid})" if mtid else str(self.id)
+
     def get_attribute(self, key: str, default=None):
         """Retrieve a value from the task's attributes dict."""
         if not self.attributes:
             return default
-        return self.attributes.get(key, default)
+        val = self.attributes.get(key, default)
+        if key == "main_task_id" and getattr(self, "id", None):
+            from lib.cuckoo.core.log import register_task_main_id
+
+            register_task_main_id(self.id, val)
+        return val
 
     def set_attribute(self, key: str, value) -> None:
         """Set a key in the task's attributes dict, initializing if None."""
         if self.attributes is None:
             self.attributes = {}
         self.attributes[key] = value
+        if key == "main_task_id" and getattr(self, "id", None):
+            from lib.cuckoo.core.log import register_task_main_id
+
+            register_task_main_id(self.id, value)
 
     def __init__(self, target=None):
         self.target = target
@@ -204,3 +225,14 @@ class Task(Base):
 
     def __repr__(self):
         return f"<Task({self.id},'{self.target}')>"
+
+
+@event.listens_for(Task, "load")
+@event.listens_for(Task, "refresh")
+def _sync_task_main_id_on_load(target: Task, *args) -> None:
+    if "attributes" in target.__dict__ and getattr(target, "id", None):
+        from lib.cuckoo.core.log import get_task_main_id, register_task_main_id
+
+        main_task_id = target.main_task_id
+        if main_task_id is not None or get_task_main_id(target.id) is not None:
+            register_task_main_id(target.id, main_task_id)

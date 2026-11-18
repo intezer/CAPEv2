@@ -1,4 +1,5 @@
 import concurrent.futures
+import concurrent.futures.process
 import hashlib
 import json
 import logging
@@ -8,6 +9,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
+import timeit
 
 # from contextlib import suppress
 from typing import Any, DefaultDict, List, Optional, Set
@@ -19,6 +22,7 @@ from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.integrations.file_extra_info_modules import (
     ExtractorReturnType,
     SuccessfulExtractionReturnType,
+    _collision_safe_destination,
     collect_extracted_filenames,
     extractor_ctx,
     time_tracker,
@@ -44,7 +48,7 @@ from lib.cuckoo.common.path_utils import (
     path_read_file,
     path_write_file,
 )
-from lib.cuckoo.common.utils import get_options, is_text_file
+from lib.cuckoo.common.utils import deduplicate_file_to_storage, get_options, is_text_file, sanitize_filename
 
 try:
     from sflock import unpack
@@ -79,6 +83,12 @@ if integration_conf.flare_capa.enabled and not integration_conf.flare_capa.on_de
 HAVE_FLOSS = False
 if integration_conf.floss.enabled and not integration_conf.floss.on_demand:
     from lib.cuckoo.common.integrations.floss import HAVE_FLOSS, Floss
+
+HAVE_MALCAT = False
+if getattr(integration_conf, "malcat", None) and integration_conf.malcat.get("enabled", False):
+    from lib.cuckoo.common.integrations.malcat.capa import malcat_details
+
+    HAVE_MALCAT = True
 
 from lib.cuckoo.common.integrations.magika import magika_info
 
@@ -148,6 +158,50 @@ if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_dema
 exclude_startswith = ("parti_",)
 excluded_extensions = (".parti",)
 tools_folder = os.path.join(cfg.cuckoo.get("tmppath", "/tmp"), "cape-external")
+_OFFICE_EXTENSIONS = (
+    ".doc",
+    ".docx",
+    ".docm",
+    ".dot",
+    ".dotm",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+    ".xlsm",
+    ".xlsb",
+    ".ppt",
+    ".pptx",
+    ".pptm",
+    ".ppsm",
+    ".pub",
+)
+
+
+_OFFICE_TYPE_MARKERS = (
+    "Rich Text Format",
+    "Microsoft Word",
+    "Microsoft Excel",
+    "Microsoft PowerPoint",
+    "Microsoft OOXML",
+    "Microsoft Office Word",
+    "Microsoft Office Excel",
+    "Microsoft Office PowerPoint",
+)
+
+
+def _is_office_target(file_path: str, data_dictionary: dict, package: str) -> bool:
+    file_name = data_dictionary.get("name", "")
+    if isinstance(file_name, list):
+        file_name = file_name[0] if file_name else ""
+    elif not isinstance(file_name, str):
+        file_name = ""
+    file_type = data_dictionary.get("type", "") or ""
+    return (
+        package in {"doc", "ppt", "xls", "pub"}
+        or file_name.lower().endswith(_OFFICE_EXTENSIONS)
+        or file_path.lower().endswith(_OFFICE_EXTENSIONS)
+        or any(marker in file_type for marker in _OFFICE_TYPE_MARKERS)
+    )
 
 
 def static_file_info(
@@ -180,6 +234,11 @@ def static_file_info(
     if "MSI Installer" in data_dictionary.get("type", "") and "msi" not in data_dictionary:
         data_dictionary["msi"] = parse_msi(file_path)
 
+    if HAVE_MALCAT and "malcat" not in data_dictionary:
+        malcat_info = malcat_details(file_path, category=category, file_type=data_dictionary.get("type", ""))
+        if malcat_info:
+            data_dictionary["malcat"] = malcat_info
+
     # ToDo we need type checking as it wont work for most of static jobs
     if HAVE_PEFILE and ("PE32" in data_dictionary.get("type", "") or "MS-DOS executable" in data_dictionary.get("type", "")):
         if "pe" not in data_dictionary:
@@ -205,10 +264,37 @@ def static_file_info(
                     if dotnet_strings:
                         data_dictionary.setdefault("dotnet_strings", dotnet_strings)
 
-    elif (HAVE_OLETOOLS and package in {"doc", "ppt", "xls", "pub"} and integration_conf.general.office) or data_dictionary.get("name", "").endswith((".doc", ".ppt", ".xls", ".pub")):
+    elif HAVE_OLETOOLS and integration_conf.general.office and _is_office_target(file_path, data_dictionary, package):
         if "office" not in data_dictionary:
+            time_start = timeit.default_timer()
             # options is dict where we need to get pass get_options
-            data_dictionary["office"] = Office(file_path, task_id, data_dictionary["sha256"], options_dict).run()
+            office_parser = Office(file_path, task_id, data_dictionary.get("sha256", ""), options_dict)
+            data_dictionary["office"] = office_parser.run()
+            if office_parser.extracted_files and destination_folder:
+                path_mkdir(tools_folder, exist_ok=True)
+                if not path_exists(destination_folder):
+                    path_mkdir(destination_folder, exist_ok=True)
+                tempdir = tempfile.mkdtemp(prefix="office_", dir=tools_folder)
+                try:
+                    written_names = []
+                    for orig_name, payload in office_parser.extracted_files:
+                        raw_name = os.path.basename((orig_name or "").replace("\\", "/").strip())
+                        safe_name = sanitize_filename(raw_name) if raw_name else "extracted.bin"
+                        if safe_name in {"", ".", ".."} or all(c == "." for c in safe_name):
+                            safe_name = "extracted.bin"
+                        dest_path = _collision_safe_destination("", os.path.join(tempdir, safe_name))
+                        _ = path_write_file(dest_path, payload)
+                        written_names.append(os.path.basename(dest_path))
+                    if written_names:
+                        metadata = _extracted_files_metadata(tempdir, destination_folder, files=written_names, results=results)
+                        if metadata:
+                            data_dictionary.setdefault("selfextract", {})["Office"] = {
+                                "extracted_files": metadata,
+                                "extracted_files_time": timeit.default_timer() - time_start,
+                                "password": options_dict.get("password", ""),
+                            }
+                finally:
+                    shutil.rmtree(tempdir, ignore_errors=True)
     elif ("PDF" in data_dictionary.get("type", "") or file_path.endswith(".pdf")) and integration_conf.general.pdf:
         if "pdf" not in data_dictionary:
             data_dictionary["pdf"] = PDF(file_path).run()
@@ -399,17 +485,19 @@ def _extracted_files_metadata(
             file_info["path"] = dest_path
             file_info["guest_paths"] = [file_info["name"]]
             file_info["name"] = os.path.basename(dest_path)
-            if not path_exists(dest_path):
-                shutil.move(full_path, dest_path)
+            dest_existed = path_exists(dest_path)
+            deduplicate_file_to_storage(full_path, file_info["sha256"], dest_path)
+            if not dest_existed:
+                folder_name = os.path.basename(os.path.normpath(destination_folder)) or "selfextracted"
                 print(
                     json.dumps(
                         {
-                            "path": os.path.join("files", file_info["sha256"]),
+                            "path": os.path.join(folder_name, file_info["sha256"]),
                             "filepath": file_info["name"],
                             "pids": [],
                             "ppids": [],
                             "metadata": "",
-                            "category": "files",
+                            "category": folder_name,
                         },
                         ensure_ascii=False,
                     ),
@@ -422,28 +510,28 @@ def _extracted_files_metadata(
 
 
 from lib.cuckoo.common.integrations.utils import run_tool
+from lib.cuckoo.common.pebble_utils import is_pool_healthy, teardown_pool
 
 # Extractor sub-pool lifecycle.
 #
 # `generic_file_extractors` runs once per extracted file, so a task with N
 # payloads calls it N times. Two strategies:
 #
-#   * Per-call (pebble default): create a fork-context pool, use it, then
-#     close+join in a finally. Safe under the pebble A/B control because the
-#     long-lived worker never has to join a persistent nested pool (which is
-#     what deadlocks in multiprocessing `_exit_function` on worker recycle).
+#   * Shared-per-task: `run_task` (under both `pebble` and `prefork` engines)
+#     and `PreforkEngine._child_main` opt into the shared-per-task pool via
+#     `enable_shared_extractor_pool()` and tear it down cleanly via
+#     `shutdown_shared_extractor_pool()`. A single pool is created on first use
+#     and reused across all N files, reclaiming the per-file fork+interpreter
+#     startup cost (~1.2s/file on heavy tasks).
 #
-#   * Shared-per-child (prefork): the prefork supervisor forks one child per
-#     task; the child sets its own process group, runs every file, then
-#     `os._exit()`. There it is safe — and much faster — to build ONE pool and
-#     reuse it across all N files, tearing it down a single time when the task
-#     finishes. This reclaims the per-file fork+interpreter-startup cost that a
-#     per-call pool pays N times (~1.2s/file on heavy tasks). The prefork child
-#     opts in via `enable_shared_extractor_pool()` and cleans up via
-#     `shutdown_shared_extractor_pool()`; any stragglers are swept by the
-#     supervisor's process-group kill.
+#   * Per-call: fallback when called outside `run_task` (e.g. ad-hoc extraction,
+#     direct module execution, or standalone tests without shared pool enabled).
+#     Creates a fork-context pool right-sized to scheduled extractors, uses it,
+#     and tears it down immediately in a finally block.
 _SHARED_EXTRACTOR_POOL = None
 _USE_SHARED_POOL = False
+_ACTIVE_EXTRACTOR_POOLS = set()
+_EXTRACTOR_FINALIZER_PID = None
 
 # Bound extractor-pool teardown. A wedged grandchild (D-state IO, a hung Java
 # decompiler — see the stray hs_err_pid dumps) would otherwise make pool.join()
@@ -457,63 +545,131 @@ EXTRACTOR_POOL_JOIN_TIMEOUT = 60
 EXTRACTOR_POOL_STOP_JOIN_TIMEOUT = 5
 
 
-def _new_extractor_pool():
+def _stop_active_extractor_pools():
+    """Force-stop any active nested extractor pools before multiprocessing's
+    _exit_function() attempts to join non-daemon child processes (e.g. when a
+    Pebble 5.2+ worker receives SIGTERM and invokes process_exit)."""
+    global _EXTRACTOR_FINALIZER_PID
+    _EXTRACTOR_FINALIZER_PID = None
+    for pool in list(_ACTIVE_EXTRACTOR_POOLS):
+        try:
+            if hasattr(pool, "stop"):
+                pool.stop()
+        except Exception:
+            pass
+        pool_mgr = getattr(pool, "_pool_manager", None)
+        worker_mgr = getattr(pool_mgr, "worker_manager", None)
+        if worker_mgr is not None:
+            try:
+                worker_mgr.close_channels()
+            except Exception:
+                pass
+            for proc in list(getattr(worker_mgr, "workers", {}).values()):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+    _ACTIVE_EXTRACTOR_POOLS.clear()
+
+
+def _register_extractor_pool(pool):
+    global _EXTRACTOR_FINALIZER_PID
+    if pool is None:
+        return pool
+    _ACTIVE_EXTRACTOR_POOLS.add(pool)
+    current_pid = os.getpid()
+    if _EXTRACTOR_FINALIZER_PID != current_pid:
+        try:
+            from multiprocessing.util import Finalize
+
+            Finalize(None, _stop_active_extractor_pools, exitpriority=100)
+            _EXTRACTOR_FINALIZER_PID = current_pid
+        except Exception:
+            pass
+    return pool
+
+
+def _is_extractor_pool_healthy(pool):
+    """Return True if a shared extractor pool's management threads and status are healthy."""
+    return is_pool_healthy(pool)
+
+
+def _init_extractor_worker():
+    """Tag nested extractor pool children so ps/htop does not mistake them for
+    top-level utils/process.py [Task N] workers."""
+    try:
+        from setproctitle import getproctitle, setproctitle
+
+        base_title = getproctitle().split(" [", 1)[0]
+        setproctitle(f"{base_title} [extractor]")
+    except Exception:
+        pass
+
+
+def _new_extractor_pool(max_workers=None):
     """Create a fresh fork-context pebble pool. Fork (not forkserver/spawn) is
     deliberate: the task child is single-threaded when the pool is created, so
     fork is deadlock-safe here, ~10ms/pool faster than forkserver, and leaves no
     orphans (workers are swept by the supervisor's process-group kill)."""
     ctx = multiprocessing.get_context("fork")
-    return pebble.ProcessPool(max_workers=int(integration_conf.general.max_workers), context=ctx)
+    configured = int(integration_conf.general.max_workers)
+    workers = max(1, min(configured, int(max_workers))) if max_workers else configured
+    return pebble.ProcessPool(max_workers=workers, initializer=_init_extractor_worker, context=ctx)
+
+
+def _create_extractor_pool(max_workers=None):
+    return _register_extractor_pool(_new_extractor_pool(max_workers=max_workers))
 
 
 def _teardown_extractor_pool(pool):
-    """Close+join a pool with a bounded wait, force-stopping any straggler so a
-    hung extractor can never wedge the worker indefinitely. Exception-safe."""
+    """Close+join a pool within a hard wall-clock bound, force-stopping any
+    straggler so a hung extractor can never wedge the worker. Exception-safe.
+
+    The pool stays registered in ``_ACTIVE_EXTRACTOR_POOLS`` if its workers
+    could not be reaped (e.g. a grandchild wedged in D-state IO), so the exit
+    finalizer still terminates them before multiprocessing's ``_exit_function``
+    joins non-daemon children."""
     if pool is None:
         return
-    try:
-        pool.close()
-        try:
-            pool.join(timeout=EXTRACTOR_POOL_JOIN_TIMEOUT)
-        except Exception:
-            log.warning(
-                "extractor pool did not drain within %ss; force-stopping stragglers",
-                EXTRACTOR_POOL_JOIN_TIMEOUT,
-            )
-            pool.stop()
-            # Bound the post-stop reap too: a grandchild wedged in uninterruptible
-            # (D-state) IO survives SIGKILL, so an unbounded join would still hang.
-            # Abandon after the bound — the process-group kill sweeps the rest.
-            try:
-                pool.join(timeout=EXTRACTOR_POOL_STOP_JOIN_TIMEOUT)
-            except Exception:
-                log.error("extractor pool did not reap after force-stop; abandoning (swept by process-group kill)")
-    except Exception:
-        log.debug("_teardown_extractor_pool: teardown raised", exc_info=True)
+    reaped = teardown_pool(
+        pool,
+        join_timeout=EXTRACTOR_POOL_JOIN_TIMEOUT,
+        stop_join_timeout=EXTRACTOR_POOL_STOP_JOIN_TIMEOUT,
+        name="extractor pool",
+    )
+    if reaped:
+        _ACTIVE_EXTRACTOR_POOLS.discard(pool)
 
 
 def enable_shared_extractor_pool():
     """Opt this process into a shared extractor pool reused across every call to
-    `generic_file_extractors`. Called by the prefork child after fork."""
+    `generic_file_extractors`. Called by the task worker before processing."""
     global _USE_SHARED_POOL
     _USE_SHARED_POOL = True
 
 
-def _acquire_extractor_pool():
+def _acquire_extractor_pool(max_workers=None):
     """Return ``(pool, is_shared)``. In shared mode a single process-wide pool is
-    created on first use and reused; otherwise a fresh per-call pool is returned."""
+    created on first use and reused (or recreated if unhealthy); otherwise a
+    fresh per-call pool right-sized to ``max_workers`` is returned."""
     global _SHARED_EXTRACTOR_POOL
     if _USE_SHARED_POOL:
+        if _SHARED_EXTRACTOR_POOL is not None and not _is_extractor_pool_healthy(_SHARED_EXTRACTOR_POOL):
+            log.warning("shared extractor pool became unhealthy; recreating")
+            dead_pool = _SHARED_EXTRACTOR_POOL
+            _SHARED_EXTRACTOR_POOL = None
+            _teardown_extractor_pool(dead_pool)
         if _SHARED_EXTRACTOR_POOL is None:
-            _SHARED_EXTRACTOR_POOL = _new_extractor_pool()
+            _SHARED_EXTRACTOR_POOL = _create_extractor_pool()
         return _SHARED_EXTRACTOR_POOL, True
-    return _new_extractor_pool(), False
+    return _create_extractor_pool(max_workers=max_workers), False
 
 
 def shutdown_shared_extractor_pool():
-    """Close+join the shared extractor pool once, if one was created. Idempotent
-    and exception-safe; called by the prefork child before it exits."""
-    global _SHARED_EXTRACTOR_POOL
+    """Close+join the shared extractor pool once, if one was created, and reset
+    shared-pool mode. Idempotent and exception-safe; called when the task finishes."""
+    global _SHARED_EXTRACTOR_POOL, _USE_SHARED_POOL
+    _USE_SHARED_POOL = False
     pool = _SHARED_EXTRACTOR_POOL
     _SHARED_EXTRACTOR_POOL = None
     _teardown_extractor_pool(pool)
@@ -554,36 +710,56 @@ def generic_file_extractors(
 
     futures = {}
     executed_tools = data_dictionary.setdefault("executed_tools", [])
-    # Per-call pool (pebble) or shared-per-child pool (prefork) — see the
-    # module-level lifecycle notes. A shared pool is reused across files and torn
-    # down once by the prefork child; a per-call pool is closed+joined here.
-    pool, shared_pool = _acquire_extractor_pool()
-    try:
-        # Prefer custom modules over the built-in ones, since only 1 is allowed
-        # to be the extracted_files_tool.
-        if extra_info_modules:
-            for module in extra_info_modules:
-                func_timeout = int(getattr(module, "timeout", 60))
-                funcname = module.__name__.split(".")[-1]
-                if funcname in executed_tools:
-                    continue
-                executed_tools.append(funcname)
-                futures[funcname] = pool.schedule(module.extract_details, args=args, kwargs=kwargs, timeout=func_timeout)
+    to_schedule = []
 
-        for extraction_func in file_info_funcs:
-            funcname = extraction_func.__name__.split(".")[-1]
-            if (
-                not getattr(integration_conf, funcname, {}).get("enabled", False)
-                and getattr(extraction_func, "enabled", False) is False
-            ):
-                continue
-
+    # Prefer custom modules over the built-in ones, since only 1 is allowed
+    # to be the extracted_files_tool.
+    if extra_info_modules:
+        for module in extra_info_modules:
+            func_timeout = int(getattr(module, "timeout", 60))
+            funcname = module.__name__.split(".")[-1]
             if funcname in executed_tools:
                 continue
             executed_tools.append(funcname)
+            to_schedule.append((funcname, module.extract_details, func_timeout))
 
-            func_timeout = int(getattr(integration_conf, funcname, {}).get("timeout", 60))
-            futures[funcname] = pool.schedule(extraction_func, args=args, kwargs=kwargs, timeout=func_timeout)
+    for extraction_func in file_info_funcs:
+        funcname = extraction_func.__name__.split(".")[-1]
+        if (
+            not getattr(integration_conf, funcname, {}).get("enabled", False)
+            and getattr(extraction_func, "enabled", False) is False
+        ):
+            continue
+
+        if funcname in executed_tools:
+            continue
+        executed_tools.append(funcname)
+
+        func_timeout = int(getattr(integration_conf, funcname, {}).get("timeout", 60))
+        to_schedule.append((funcname, extraction_func, func_timeout))
+
+    if not to_schedule:
+        return
+
+    # Lazily acquire the per-call pool or shared-per-task pool only when at
+    # least one extractor is actually scheduled.
+    pool, shared_pool = _acquire_extractor_pool(max_workers=len(to_schedule))
+    try:
+        for funcname, fn, func_timeout in to_schedule:
+            try:
+                futures[funcname] = pool.schedule(fn, args=args, kwargs=kwargs, timeout=func_timeout)
+            except (RuntimeError, concurrent.futures.process.BrokenProcessPool) as err:
+                if shared_pool:
+                    log.warning("shared extractor pool schedule failed (%s); recreating pool and retrying", err)
+                    shutdown_shared_extractor_pool()
+                    enable_shared_extractor_pool()
+                    pool, shared_pool = _acquire_extractor_pool(max_workers=len(to_schedule))
+                    try:
+                        futures[funcname] = pool.schedule(fn, args=args, kwargs=kwargs, timeout=func_timeout)
+                    except Exception as retry_err:
+                        log.exception("failed to schedule extractor %s after pool recreation: %s", funcname, retry_err)
+                else:
+                    log.exception("failed to schedule extractor %s: %s", funcname, err)
 
         for funcname, future in futures.items():
             func_result = None
@@ -634,9 +810,9 @@ def generic_file_extractors(
                     # ToDo doesn't work
                     shutil.rmtree(tempdir, ignore_errors=True)
     finally:
-        # A shared pool (prefork) is kept warm for the next file and torn down
-        # once by the child via shutdown_shared_extractor_pool(); a per-call
-        # pool (pebble) is torn down here so no nested pool outlives the call.
+        # A shared pool (run_task / prefork) is kept warm for the next file and
+        # torn down once via shutdown_shared_extractor_pool(); a per-call pool
+        # is torn down here so no nested pool outlives the call.
         if not shared_pool:
             _teardown_extractor_pool(pool)
 
@@ -699,17 +875,23 @@ def vbe_extract(file: str, **_) -> ExtractorReturnType:
 
 @time_tracker
 def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnType:
-    if file.endswith("_Slayed"):
+    """Deprecated: .NET Reactor deobfuscation is handled by de4dotEx under de4dot_deobfuscate."""
+    if file.endswith("_Slayed") or os.path.splitext(file)[0].endswith("_Slayed"):
         return
 
     if all(".NET Reactor" not in string for string in data_dictionary.get("die", [])):
         return
 
-    binary = shlex.split(integration_conf.eziriz_deobfuscate.binary.strip())[0]
-    binary = os.path.join(CUCKOO_ROOT, binary)
-    if not binary:
+    eziriz_conf = integration_conf.eziriz_deobfuscate or {}
+    raw_binary = (eziriz_conf.get("binary") or "").strip()
+    if not raw_binary:
         log.warning("eziriz_deobfuscate.binary is not defined in the configuration.")
         return
+    binary_parts = shlex.split(raw_binary)
+    if not binary_parts:
+        log.warning("eziriz_deobfuscate.binary is not defined in the configuration.")
+        return
+    binary = os.path.join(CUCKOO_ROOT, binary_parts[0])
 
     if not path_exists(binary):
         log.error(
@@ -725,19 +907,61 @@ def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorRet
     with extractor_ctx(file, "eziriz", prefix="eziriz_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = run_tool(
-            [
-                os.path.join(CUCKOO_ROOT, binary),
-                *shlex.split(integration_conf.eziriz_deobfuscate.extra_args.strip()),
-                file,
-            ],
-            universal_newlines=True,
-            stderr=subprocess.PIPE,
-        )
-        deobf_file = file + "_Slayed"
-        if path_exists(deobf_file):
-            shutil.move(deobf_file, dest_path)
-            ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        work_dir = os.path.join(tempdir, "_work")
+        path_mkdir(work_dir, exist_ok=True)
+        staged_name = os.path.basename(file)
+        staged_file = os.path.join(work_dir, staged_name)
+        shutil.copy2(file, staged_file)
+
+        extra_args = shlex.split((eziriz_conf.get("extra_args") or "").strip())
+        if "--no-pause" not in {arg.lower().split("=", 1)[0] for arg in extra_args}:
+            extra_args = ["--no-pause", "True", *extra_args]
+
+        output = ""
+        try:
+            output = run_tool(
+                [binary, *extra_args, staged_file],
+                universal_newlines=True,
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            staged_stem, staged_ext = os.path.splitext(staged_file)
+            slayed_candidates = [f"{staged_stem}_Slayed{staged_ext}", f"{staged_file}_Slayed"]
+            for candidate in slayed_candidates:
+                if path_exists(candidate):
+                    shutil.move(candidate, dest_path)
+                    break
+
+            for entry in os.listdir(work_dir):
+                if entry in (staged_name, "PEImage.tmp"):
+                    continue
+                clean_name = entry.replace("\\", "/").rsplit("/", 1)[-1]
+                if not clean_name or clean_name in (".", "..", "PEImage.tmp"):
+                    continue
+                src = os.path.join(work_dir, entry)
+                if not path_is_file(src):
+                    continue
+                target = _collision_safe_destination(src, os.path.join(tempdir, clean_name))
+                shutil.move(src, target)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        for entry in list(os.listdir(tempdir)):
+            if "\\" not in entry:
+                continue
+            src = os.path.join(tempdir, entry)
+            clean_name = entry.rsplit("\\", 1)[-1]
+            if clean_name in ("", ".", "..", "PEImage.tmp"):
+                if path_is_file(src):
+                    os.unlink(src)
+                continue
+            if path_is_file(src):
+                target = _collision_safe_destination(src, os.path.join(tempdir, clean_name))
+                shutil.move(src, target)
+
+        ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        if not ctx.get("extracted_files") and output:
+            log.debug("eziriz_deobfuscate produced no output files for %s: %s", file, output.strip())
 
     return ctx
 
@@ -747,30 +971,47 @@ def de4dot_deobfuscate(file: str, *, filetype: str, **_) -> ExtractorReturnType:
     if "Mono" not in filetype:
         return
 
-    binary = shlex.split(integration_conf.de4dot_deobfuscate.binary.strip())[0]
-    if not binary:
+    de4dot_conf = integration_conf.de4dot_deobfuscate or {}
+    raw_binary = (de4dot_conf.get("binary") or "").strip()
+    if not raw_binary:
         log.warning("de4dot_deobfuscate.binary is not defined in the configuration.")
         return
-    if not path_exists(binary):
-        log.error("Missed dependency: sudo apt install de4dot")
+    binary_parts = shlex.split(raw_binary)
+    if not binary_parts:
+        log.warning("de4dot_deobfuscate.binary is not defined in the configuration.")
         return
+    binary = binary_parts[0] if os.path.isabs(binary_parts[0]) else os.path.join(CUCKOO_ROOT, binary_parts[0])
+    if not path_exists(binary):
+        if binary == "/usr/local/bin/de4dot" and path_exists("/usr/bin/de4dot"):
+            binary = "/usr/bin/de4dot"
+        elif binary == "/usr/bin/de4dot" and path_exists("/usr/local/bin/de4dot"):
+            binary = "/usr/local/bin/de4dot"
+
+    if not path_exists(binary):
+        log.error(
+            "Missing dependency: Install de4dotEx from https://github.com/GDATAAdvancedAnalytics/de4dotEx/releases (or sudo apt install de4dot): %s",
+            binary,
+        )
+        return
+
+    if not os.access(binary, os.X_OK):
+        log.error("You need to add execution permissions: chmod a+x %s", binary)
+        return
+
+    extra_args = shlex.split((de4dot_conf.get("extra_args") or "").strip())
 
     with extractor_ctx(file, "de4dot", prefix="de4dot_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = run_tool(
-            [
-                binary,
-                *shlex.split(integration_conf.de4dot_deobfuscate.extra_args.strip()),
-                "-f",
-                file,
-                "-o",
-                dest_path,
-            ],
+        output = run_tool(
+            [binary, *extra_args, "-f", file, "-o", dest_path],
             universal_newlines=True,
-            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
         )
         ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        if not ctx.get("extracted_files") and output:
+            log.debug("de4dot_deobfuscate produced no output files for %s: %s", file, output.strip())
 
     return ctx
 

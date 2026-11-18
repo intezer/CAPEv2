@@ -10,13 +10,6 @@ Install Python
 
 Python is a strict requirement for the CAPE guest component (*analyzer*) to run properly.
 
-.. warning::
-    Please note that **only 32-bit (x86) versions of Python3 are
-    supported** at this time for Windows, due to the way the analyzer
-    interacts with low-level Windows libraries. Using a 64-bit version
-    of Python will crash the analyzer in Windows. For other platforms the
-    version of Python can be 64-bit (x64).
-
 You can download the proper `Windows`_ / `Linux`_ installer from the `official website`_.
 Python versions > 3.10 and < 3.13 are preferred.
 
@@ -50,6 +43,23 @@ to download and install the proper packages according to your Python version.
 .. _`Linux`: https://www.python.org/downloads/source/
 .. _`official website`: http://www.python.org/getit/
 .. _`Python Image Library`: https://python-pillow.org
+
+Archive packages
+================
+
+Install archive extraction tools inside the Windows guest before saving its
+snapshot. The ``archive`` package requires 7-Zip. Install it in the standard
+``7-Zip`` directory under ``Program Files`` or ``Program Files (x86)``, so the
+analyzer can find ``7z.exe``. Installing 7-Zip on the CAPE host does not satisfy
+this requirement.
+
+If you set ``recursion_depth`` above zero, also install Detect It Easy in the
+guest with its extra database and ``diec.exe`` in the ``die`` directory under
+``Program Files`` or ``Program Files (x86)``. Detect It Easy is not needed for
+non-recursive extraction with this package.
+
+The ``rar`` package has its own Python dependency. See :doc:`../../usage/packages`
+for its prerequisites and the other archive package options.
 
 Additional Software
 ===================

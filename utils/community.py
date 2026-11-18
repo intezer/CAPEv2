@@ -5,6 +5,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 import zipfile
 from contextlib import suppress
@@ -15,6 +16,7 @@ if sys.version_info[:2] < (3, 8):
 import argparse
 import logging
 import tarfile
+import time
 from io import BytesIO
 
 import urllib3
@@ -32,6 +34,26 @@ if path_exists(os.path.join(CUCKOO_ROOT, "utils", "community_blocklist.py")):
 
 log = logging.getLogger(__name__)
 
+# Resolved once per process by core_tracked_files(). None means "could not be
+# determined"; the sentinel distinguishes that from "not looked up yet".
+_UNSET = object()
+_CORE_TRACKED_CACHE = _UNSET
+_HTTP_RETRY = urllib3.Retry(
+    total=5,
+    connect=5,
+    read=5,
+    status=5,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+)
+
+
+def _http_client(proxy=None):
+    timeout = urllib3.Timeout(connect=15.0, read=60.0)
+    if proxy:
+        return urllib3.ProxyManager(proxy, retries=_HTTP_RETRY, timeout=timeout)
+    return urllib3.PoolManager(retries=_HTTP_RETRY, timeout=timeout)
+
 
 def flare_capa(proxy=None):
     signature_urls = (
@@ -40,10 +62,7 @@ def flare_capa(proxy=None):
         "https://github.com/mandiant/capa/raw/master/sigs/3_flare_common_libs.sig",
     )
     try:
-        if proxy:
-            http = urllib3.ProxyManager(proxy)
-        else:
-            http = urllib3.PoolManager()
+        http = _http_client(proxy)
         data = http.request("GET", "https://github.com/mandiant/capa-rules/archive/master.zip").data
         dest_folder = os.path.join(CUCKOO_ROOT, "data")
         shutil.rmtree((os.path.join(dest_folder, "capa-rules-master")), ignore_errors=True)
@@ -68,31 +87,108 @@ def flare_capa(proxy=None):
         print(e)
 
 
-def install(enabled, force, rewrite, clean=False, filepath: str = False, access_token=None, proxy=False, url: str = False):
+def is_blocklisted(category: str, relpath: str, filepath: str) -> bool:
+    """Is this file pinned by utils/community_blocklist.py?
+
+    The blocklist documents entries as "<category>/<path>", e.g.
+    "signatures/my_amazing_signature.py", so match against that form as well as
+    the bare path inside the category folder and the absolute destination path.
+    """
+    entries = blocklist.get(category)
+    if not entries:
+        return False
+
+    relpath = relpath.replace("\\", "/")
+    candidates = {
+        os.path.normpath(filepath),
+        os.path.normpath(relpath),
+        os.path.normpath(f"{category}/{relpath}"),
+    }
+    return any(os.path.normpath(str(entry).replace("\\", "/")) in candidates for entry in entries)
+
+
+def clean_category(folder: str) -> None:
+    """Delete the installed content of a category, rooted at CUCKOO_ROOT."""
+    target = os.path.join(CUCKOO_ROOT, folder)
+    if path_exists(target):
+        shutil.rmtree(target)
+
+
+def core_tracked_files():
+    """Paths tracked by the CAPEv2 git repository, relative to CUCKOO_ROOT.
+
+    Returns None when that cannot be determined (no git, not a checkout), in
+    which case callers must not enforce anything.
+    """
+    global _CORE_TRACKED_CACHE
+    if _CORE_TRACKED_CACHE is not _UNSET:
+        return _CORE_TRACKED_CACHE
+
+    tracked = None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", CUCKOO_ROOT, "ls-files", "-z"],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode == 0:
+            tracked = frozenset(os.path.normpath(entry) for entry in proc.stdout.decode("utf-8", "replace").split("\0") if entry)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("Unable to list files tracked by the core repository: %s", e)
+
+    _CORE_TRACKED_CACHE = tracked
+    return tracked
+
+
+def shadows_core_file(folder: str, relpath: str) -> bool:
+    """Would installing this community file replace a file shipped by CAPEv2 itself?"""
+    tracked = core_tracked_files()
+    if not tracked:
+        return False
+    return os.path.normpath(os.path.join(folder, relpath.replace("\\", "/"))) in tracked
+
+
+def install(
+    enabled,
+    force,
+    rewrite,
+    clean=False,
+    filepath: str = False,
+    access_token=None,
+    proxy=False,
+    url: str = False,
+    shadow_core: bool = False,
+):
     if filepath and path_exists(filepath):
         t = tarfile.TarFile.open(filepath, mode="r:gz")
     else:
         print(f"Downloading modules from {url}")
-        try:
-            if proxy:
-                http = urllib3.ProxyManager(proxy)
+        http = _http_client(proxy)
+        headers = None
+        if access_token is not None:
+            if "github" in url:
+                headers = {"Authorization": f"token {access_token}", "User-Agent": "CAPEv2_sandbox"}
             else:
-                http = urllib3.PoolManager()
-            if access_token is None:
-                data = http.request("GET", url).data
-            elif "github" in url:
-                data = http.request(
-                    "GET", url, headers={"Authorization": f"token {access_token}", "User-Agent": "CAPEv2_sandbox"}
-                ).data
-            else:
-                data = http.request("GET", url, headers={"PRIVATE-TOKEN": access_token}).data
+                headers = {"PRIVATE-TOKEN": access_token}
 
-            if b"Not Found" == data:
-                print("You don't have permissions to access this repo")
-                return
-            t = tarfile.TarFile.open(fileobj=BytesIO(data), mode="r:gz")
-        except Exception as e:
-            print("ERROR: Unable to download archive: %s" % e)
+        t = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = http.request("GET", url, headers=headers)
+                data = resp.data
+                if b"Not Found" == data or resp.status == 404:
+                    print("You don't have permissions to access this repo")
+                    return
+                t = tarfile.TarFile.open(fileobj=BytesIO(data), mode="r:gz")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        if t is None:
+            print("ERROR: Unable to download archive: %s" % last_err)
             return
 
     folders = {
@@ -112,6 +208,7 @@ def install(enabled, force, rewrite, clean=False, filepath: str = False, access_
 
     members = t.getmembers()
     directory = members[0].name.split("/", 1)[0]
+    shadowed = []
 
     for category in enabled:
         folder = folders.get(category, False)
@@ -120,9 +217,9 @@ def install(enabled, force, rewrite, clean=False, filepath: str = False, access_
 
         print(f"\nInstalling {colors.cyan(category.upper())}")
 
-        if clean and path_exists(folder):
+        if clean:
             print(f"\n Deleting the folder content of the category {colors.cyan(category.upper())}")
-            shutil.rmtree(folder)
+            clean_category(folder)
 
         # E.g., "community-master/modules/signatures".
         name_start = f"{directory}/{folder}"
@@ -130,7 +227,8 @@ def install(enabled, force, rewrite, clean=False, filepath: str = False, access_
             if not member.name.startswith(name_start) or name_start == member.name:
                 continue
 
-            filepath = os.path.join(CUCKOO_ROOT, folder, member.name[len(name_start) + 1 :])
+            relpath = member.name[len(name_start) + 1 :]
+            filepath = os.path.join(CUCKOO_ROOT, folder, relpath)
             if member.name.lower().endswith((".gitignore", "readme.md", "-ci.yml")):
                 continue
 
@@ -139,15 +237,27 @@ def install(enabled, force, rewrite, clean=False, filepath: str = False, access_
                     path_mkdir(filepath)
                 continue
 
-            if not rewrite and path_exists(filepath):
-                print(f'File "{filepath}" already exists, {colors.yellow("skipped")}')
+            if not member.isfile():
                 continue
 
             install = False
             dest_file = os.path.basename(filepath)
+            is_core = shadows_core_file(folder, relpath)
 
-            if filepath in blocklist.get(category, []):
+            if is_blocklisted(category, relpath, filepath):
                 print(f'You have blocklisted file: {dest_file}. {colors.yellow("skipped")}')
+                continue
+
+            # A community file with the same path as a file shipped by CAPEv2 itself
+            # replaces it outright - there is no namespacing between the two. Require
+            # that to be asked for explicitly.
+            if not shadow_core and is_core:
+                print(f'File "{filepath}" is shipped by CAPEv2 itself, {colors.yellow("skipped")} (use --shadow-core)')
+                shadowed.append(os.path.join(folder, relpath))
+                continue
+
+            if not rewrite and not (shadow_core and is_core) and path_exists(filepath):
+                print(f'File "{filepath}" already exists, {colors.yellow("skipped")}')
                 continue
 
             if not force:
@@ -166,11 +276,26 @@ def install(enabled, force, rewrite, clean=False, filepath: str = False, access_
                     path_mkdir(os.path.dirname(filepath))
 
                 try:
+                    extracted = t.extractfile(member)
+                    if extracted is None:
+                        continue
                     with open(filepath, "wb") as f:
-                        f.write(t.extractfile(member).read())
+                        f.write(extracted.read())
+                    if member.mode & 0o111:
+                        os.chmod(filepath, 0o755)
+                    else:
+                        current_mode = os.stat(filepath).st_mode & 0o777
+                        if current_mode & 0o111:
+                            os.chmod(filepath, current_mode & ~0o111)
                     print(f'File "{filepath}" {colors.green("installed")}')
                 except PermissionError:
                     print(colors.red(f"Fix permission on: {filepath}"))
+
+    if shadowed:
+        print(colors.yellow(f"\n{len(shadowed)} community file(s) were not installed because CAPEv2 ships the same path:"))
+        for path in shadowed:
+            print(f"  {path}")
+        print("Pass --shadow-core to install them anyway, or pin them in utils/community_blocklist.py.")
 
 
 def ipinfo_asn_database_fetch(token, proxy=False):
@@ -205,6 +330,13 @@ def main():
         "-f", "--force", help="Install files without confirmation", action="store_true", default=False, required=False
     )
     parser.add_argument("-w", "--rewrite", help="Rewrite existing files", action="store_true", required=False)
+    parser.add_argument(
+        "-sc",
+        "--shadow-core",
+        help="Allow community files to replace files shipped by CAPEv2 itself (implies --rewrite for those paths)",
+        action="store_true",
+        required=False,
+    )
     parser.add_argument("-b", "--branch", help="Specify a different branch", action="store", default="master", required=False)
     parser.add_argument(
         "--file", help="Specify a local copy of a community .zip file", action="store", default=False, required=False
@@ -313,6 +445,7 @@ def main():
         args.token,
         args.proxy,
         args.url or f"https://github.com/kevoreilly/community/archive/{args.branch}.tar.gz",
+        args.shadow_core,
     )
 
 

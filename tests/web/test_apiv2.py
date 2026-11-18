@@ -225,3 +225,395 @@ class TestReservedMachineSubmission(SimpleTestCase):
 
         assert response.status_code == 200
         assert response.json()["data"]["task_ids"] == [123]
+
+
+@pytest.mark.usefixtures("db", "tmp_cuckoo_root")
+class TestYaraUploaderSanitization(SimpleTestCase):
+    @staticmethod
+    def _build_fake_plyara(parsed_rules):
+        def _rebuild_yara_rule(rule):
+            meta_lines = []
+            for item in rule.get("metadata", []):
+                for k, v in item.items():
+                    meta_lines.append(f'        {k} = "{v}"')
+            meta_block = "\n".join(meta_lines)
+            return f"rule {rule['rule_name']} {{\n    meta:\n{meta_block}\n    condition:\n        true\n}}"
+
+        class _FakePlyaraInstance:
+            def parse_string(self, _content):
+                return [
+                    {
+                        "rule_name": r["rule_name"],
+                        "metadata": [dict(m) for m in r.get("metadata", [])],
+                    }
+                    for r in parsed_rules
+                ]
+
+        return SimpleNamespace(
+            Plyara=_FakePlyaraInstance,
+            utils=SimpleNamespace(rebuild_yara_rule=_rebuild_yara_rule),
+        )
+
+    def _post_rule(self, rule_text: str, upload_name: str = "rule.yar", category: str = "CAPE", **extra):
+        uploaded_file = SimpleUploadedFile(
+            upload_name,
+            rule_text.encode("utf-8"),
+            content_type="text/plain",
+        )
+        return self.client.post(
+            "/apiv2/yara_uploader/",
+            {"category": category, "file": uploaded_file},
+            **extra,
+        )
+
+    def test_rejects_invalid_or_non_string_family_metadata(self):
+        invalid_families = (
+            "../../evil",
+            "..\\..\\evil",
+            "..",
+            ".",
+            ".hidden",
+            "bad..name",
+            123,
+            True,
+        )
+        rule_text = 'rule test_rule { strings: $a = "test" condition: $a }'
+        for bad_family in invalid_families:
+            with self.subTest(bad_family=bad_family):
+                fake_plyara = self._build_fake_plyara(
+                    [{"rule_name": "test_rule", "metadata": [{"family": bad_family}]}]
+                )
+                with (
+                    patch("apiv2.views.HAVE_PLYARA", True),
+                    patch("apiv2.views.plyara", fake_plyara, create=True),
+                    patch.dict("apiv2.views.apiconf.yara_uploader", {"enabled": True, "auth_only": False}),
+                    patch("apiv2.views.DIST_ENABLED", False),
+                ):
+                    response = self._post_rule(rule_text)
+
+                assert response.status_code == 400
+                assert response.json()["status"] == "error"
+                assert "family" in response.json()["message"].lower()
+
+    def test_non_yar_upload_filename_falls_back_to_family_yar_and_existing_yar_appends(self):
+        import tempfile
+
+        rule_text = 'rule test_valid_family { strings: $a = "test" condition: $a }'
+        fake_plyara = self._build_fake_plyara(
+            [{"rule_name": "test_valid_family", "metadata": [{"family": "TestFamily"}]}]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            dest_dir = tmp_path / "data" / "yara" / "CAPE"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            readme = dest_dir / "README.md"
+            readme.write_text("do not overwrite", encoding="utf-8")
+
+            with (
+                patch("apiv2.views.HAVE_PLYARA", True),
+                patch("apiv2.views.plyara", fake_plyara, create=True),
+                patch.dict("apiv2.views.apiconf.yara_uploader", {"enabled": True, "auth_only": False}),
+                patch("apiv2.views.CUCKOO_ROOT", str(tmp_path)),
+                patch("apiv2.views.DIST_ENABLED", False),
+            ):
+                resp_readme = self._post_rule(rule_text, upload_name="README.md")
+
+            assert resp_readme.status_code == 200
+            assert readme.read_text(encoding="utf-8") == "do not overwrite"
+            assert (dest_dir / "TestFamily.yar").is_file()
+
+    def test_auth_only_requires_authentication_and_accepts_api_key(self):
+        import tempfile
+
+        rule_text = 'rule test_auth_family { strings: $a = "test" condition: $a }'
+        fake_plyara = self._build_fake_plyara(
+            [{"rule_name": "test_auth_family", "metadata": [{"family": "AuthFamily"}]}]
+        )
+        fake_user = SimpleNamespace(is_authenticated=True, username="analyst")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            with (
+                patch("apiv2.views.HAVE_PLYARA", True),
+                patch("apiv2.views.plyara", fake_plyara, create=True),
+                patch.dict("apiv2.views.apiconf.yara_uploader", {"enabled": True, "auth_only": True}),
+                patch("apiv2.views.CUCKOO_ROOT", str(tmp_path)),
+                patch("apiv2.views.DIST_ENABLED", False),
+            ):
+                unauth_resp = self._post_rule(rule_text)
+                assert unauth_resp.status_code == 401
+
+                with patch("apiv2.views.ApiKeyAuthentication") as mock_auth_cls:
+                    mock_auth_cls.return_value.authenticate.return_value = (fake_user, "token")
+                    auth_resp = self._post_rule(rule_text, HTTP_AUTHORIZATION="Token test-token")
+
+            assert auth_resp.status_code == 200
+            saved = (tmp_path / "data" / "yara" / "CAPE" / "AuthFamily.yar").read_text(encoding="utf-8")
+            assert "analyst" in saved
+
+
+@pytest.mark.usefixtures("db", "tmp_cuckoo_root")
+class TestTasksIocs(SimpleTestCase):
+    def test_tasks_iocs_tolerates_missing_target_file_path_and_guest_paths(self):
+        report_buf = {
+            "malscore": 5.0,
+            "detections": [],
+            "info": {"id": 1, "custom": "", "machine": {"manager": "kvm", "label": "win10", "id": 1, "name": "win10"}},
+            "target": {"category": "file", "file": {"name": "sample.exe", "sha256": "a" * 64}},
+            "network": {},
+            "behavior": {"summary": {}, "processtree": []},
+            "dropped": [],
+        }
+        with (
+            patch.dict("apiv2.views.apiconf.taskiocs", {"enabled": True}),
+            patch.dict("apiv2.views.repconf.mongodb", {"enabled": True}),
+            patch("apiv2.views.validate_task", return_value={"error": False, "rtid": 1}),
+            patch("apiv2.views.mongo_find_one", return_value=report_buf, create=True),
+        ):
+            resp = self.client.get("/apiv2/tasks/get/iocs/1/")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["error"] is False
+        assert body["data"]["target"]["file"] == {"name": "sample.exe", "sha256": "a" * 64}
+
+
+@pytest.mark.usefixtures("db", "tmp_cuckoo_root")
+class TestEncryptedSampleDownload(SimpleTestCase):
+    def test_encrypted_sample_download_uses_cape_external_dir(self):
+        import subprocess
+        import tempfile
+
+        sha256 = "b" * 64
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            sample_path = root / "sample.bin"
+            sample_path.write_bytes(b"MZ-encrypted-sample-test")
+            ext_dir = root / "cape-external"
+            ext_dir.mkdir()
+
+            with (
+                patch.dict("apiv2.views.apiconf.sampledl", {"enabled": True}),
+                patch("apiv2.views.db.sample_path_by_hash", return_value=[str(sample_path)]),
+                patch("apiv2.views.USE_SEVENZIP", False),
+                patch("apiv2.views.get_cape_external_dir", return_value=str(ext_dir)),
+            ):
+                resp = self.client.get(f"/apiv2/files/get/sha256/{sha256}/?encrypted=1")
+                assert resp.status_code == 200
+                payload = b"".join(resp.streaming_content)
+                resp.close()
+
+                expected_zip = ext_dir / f"{sha256}.zip"
+                assert expected_zip.is_file()
+                assert len(payload) > 0
+
+                # Second call hits cached zip inside cape-external without re-archiving.
+                with patch("apiv2.views.pyzipper.AESZipFile", side_effect=AssertionError("unexpected re-zip")):
+                    cached_resp = self.client.get(f"/apiv2/files/get/sha256/{sha256}/?encrypted=1")
+                    assert cached_resp.status_code == 200
+                    cached_payload = b"".join(cached_resp.streaming_content)
+                    cached_resp.close()
+                assert cached_payload == payload
+
+                # Failed 7z compression cleans up temp zip and does not leave a corrupt cached archive.
+                expected_zip.unlink()
+                with (
+                    patch("apiv2.views.USE_SEVENZIP", True),
+                    patch("apiv2.views.subprocess.check_call", side_effect=subprocess.CalledProcessError(1, ["7z"])),
+                ):
+                    err_resp = self.client.get(f"/apiv2/files/get/sha256/{sha256}/?encrypted=1")
+                    assert err_resp.status_code == 200
+                    assert err_resp.json()["error"] is True
+                assert list(ext_dir.iterdir()) == []
+
+    def test_pcapng_response_uses_cape_external_and_unlinks_on_empty_output(self):
+        import tempfile
+        from apiv2.views import _pcapng_response
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            adir = root / "storage" / "analyses" / "99"
+            adir.mkdir(parents=True)
+            (adir / "dump.pcap").write_bytes(b"pcap")
+            ext_dir = root / "cape-external"
+            ext_dir.mkdir()
+
+            class _EmptyPcapToNg:
+                def __init__(self, *_a):
+                    pass
+
+                def generate(self, _out_path):
+                    # Leave 0-byte file
+                    pass
+
+            with (
+                patch("apiv2.views.CUCKOO_ROOT", str(root)),
+                patch("apiv2.views.get_cape_external_dir", return_value=str(ext_dir)),
+                patch("lib.cuckoo.common.pcap_utils.PcapToNg", _EmptyPcapToNg),
+            ):
+                resp = _pcapng_response(99)
+                assert resp.data["error"] is True
+            assert list(ext_dir.iterdir()) == []
+
+
+@pytest.mark.usefixtures("db", "tmp_cuckoo_root")
+class TestBulkReportsDownload(SimpleTestCase):
+    def test_bulk_reports_disabled_by_default_and_when_toggle_off(self):
+        with patch("apiv2.views.settings.ALLOW_DL_REPORTS_TO_ALL", True):
+            resp_default = self.client.get("/apiv2/tasks/get/reports/bulk/10-12/json/")
+            assert resp_default.status_code == 200
+            assert resp_default.json() == {"error": True, "error_value": "Bulk Report Download API is Disabled"}
+
+            for raw_toggle in (False, "no", "0"):
+                with patch.dict("apiv2.views.apiconf.taskreport", {"enabled": True, "bulk_download": raw_toggle}):
+                    resp_off = self.client.get("/apiv2/tasks/get/reports/bulk/10-12/json/")
+                    assert resp_off.status_code == 200
+                    assert resp_off.json() == {"error": True, "error_value": "Bulk Report Download API is Disabled"}
+
+    def test_bulk_reports_download_by_sha256_and_package_filter(self):
+        from io import BytesIO
+        import tempfile
+        import zipfile
+
+        sha_one = "1" * 64
+        sha_two = "2" * 64
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            analyses_root = root / "storage" / "analyses"
+            for tid, payload in ((10, b'{"id": 10}'), (11, b'{"id": 11}'), (12, b'{"id": 12}')):
+                rdir = analyses_root / str(tid) / "reports"
+                rdir.mkdir(parents=True)
+                (rdir / "report.json").write_bytes(payload)
+
+            tasks_by_id = {
+                10: SimpleNamespace(id=10, package="exe", status=TASK_REPORTED, tlp=None, sample=SimpleNamespace(sha256=sha_one)),
+                11: SimpleNamespace(id=11, package="exe", status=TASK_REPORTED, tlp=None, sample=SimpleNamespace(sha256=sha_one)),
+                12: SimpleNamespace(id=12, package="dll", status=TASK_REPORTED, tlp=None, sample=SimpleNamespace(sha256=sha_two)),
+            }
+
+            with (
+                patch.dict("apiv2.views.apiconf.taskreport", {"enabled": True, "bulk_download": True}),
+                patch("apiv2.views.settings.ALLOW_DL_REPORTS_TO_ALL", True),
+                patch("apiv2.views.CUCKOO_ROOT", str(root)),
+                patch("apiv2.views.ANALYSIS_BASE_PATH", str(root / "storage")),
+                patch("apiv2.views.validate_task", side_effect=lambda tid: {"error": tid not in tasks_by_id, "tlp": None}),
+                patch("apiv2.views.db.view_task", side_effect=lambda tid, details=True: tasks_by_id.get(tid)),
+            ):
+                resp = self.client.get("/apiv2/tasks/get/reports/bulk/10-12/json/")
+                assert resp.status_code == 200
+                assert resp["Content-Type"] == "application/zip"
+                raw_zip = b"".join(resp.streaming_content)
+                assert int(resp["Content-Length"]) == len(raw_zip)
+                with zipfile.ZipFile(BytesIO(raw_zip), "r") as zf:
+                    names = sorted(zf.namelist())
+                    assert names == sorted([f"{sha_one}.json", f"{sha_one}_11.json", f"{sha_two}.json"])
+                    assert zf.read(f"{sha_one}.json") == b'{"id": 10}'
+                    assert zf.read(f"{sha_one}_11.json") == b'{"id": 11}'
+                    assert zf.read(f"{sha_two}.json") == b'{"id": 12}'
+
+                # Filter by package=dll
+                resp_dll = self.client.get("/apiv2/tasks/get/reports/bulk/?task_ids=10-12&report_format=json&package=dll")
+                assert resp_dll.status_code == 200
+                raw_zip_dll = b"".join(resp_dll.streaming_content)
+                with zipfile.ZipFile(BytesIO(raw_zip_dll), "r") as zf:
+                    assert zf.namelist() == [f"{sha_two}.json"]
+
+    def test_bulk_reports_rejects_excessive_range_and_invalid_format(self):
+        with (
+            patch.dict("apiv2.views.apiconf.taskreport", {"enabled": True, "bulk_download": True}),
+            patch("apiv2.views.settings.ALLOW_DL_REPORTS_TO_ALL", True),
+        ):
+            resp_range = self.client.get("/apiv2/tasks/get/reports/bulk/10-13/json/")
+            assert resp_range.status_code == 200
+            assert resp_range.json()["error"] is True
+            assert "maximum of 3 reports" in resp_range.json()["error_value"]
+
+            resp_fmt = self.client.get("/apiv2/tasks/get/reports/bulk/10-12/not_a_format/")
+            assert resp_fmt.status_code == 200
+            assert resp_fmt.json() == {"error": True, "error_value": "Invalid report format specified"}
+
+    def test_analysis_index_template_hides_and_shows_bulk_download_toolbar(self):
+        from django.template.loader import render_to_string
+
+        base_ctx = {
+            "title": "Recent Analysis",
+            "files": [],
+            "static": [],
+            "urls": [],
+            "pcaps": [],
+            "paging": {},
+        }
+
+        html_disabled = render_to_string(
+            "analysis/index.html",
+            {**base_ctx, "config": {"bulk_download": False, "bulk_max_reports": 3}},
+        )
+        assert "Bulk Download Reports" not in html_disabled
+        assert 'id="bulkReportDownloadCollapse"' not in html_disabled
+
+        html_enabled = render_to_string(
+            "analysis/index.html",
+            {**base_ctx, "config": {"bulk_download": True, "bulk_max_reports": 3}},
+        )
+        assert "Bulk Download Reports" in html_enabled
+        assert 'id="bulkReportDownloadCollapse"' in html_enabled
+        assert "(max 3)" in html_enabled
+
+    def test_analysis_index_view_bulk_download_flag_and_permissions(self):
+        from django.contrib.auth.models import AnonymousUser
+        from django.test import RequestFactory
+        import analysis.views as analysis_views
+
+        rf = RequestFactory()
+        anon_req = rf.get("/analysis/")
+        anon_req.user = AnonymousUser()
+
+        permitted_req = rf.get("/analysis/")
+        permitted_req.user = SimpleNamespace(is_authenticated=True, userprofile=SimpleNamespace(reports=True))
+
+        denied_req = rf.get("/analysis/")
+        denied_req.user = SimpleNamespace(is_authenticated=True, userprofile=SimpleNamespace(reports=False))
+
+        api_cfg_enabled = SimpleNamespace(taskreport={"enabled": "yes", "bulk_download": "yes", "bulk_max_reports": 5})
+        api_cfg_str_no = SimpleNamespace(taskreport={"enabled": "yes", "bulk_download": "no", "bulk_max_reports": 5})
+        api_cfg_str_zero = SimpleNamespace(taskreport={"enabled": "1", "bulk_download": "0", "bulk_max_reports": 5})
+
+        with (
+            patch.dict(analysis_views.enabledconf, {"mongodb": False, "url_analysis": False}),
+            patch.object(analysis_views, "es_as_db", False),
+            patch.object(analysis_views.db, "list_tasks", return_value=[]),
+            patch.object(analysis_views.db, "count_matching_tasks", return_value=0),
+            patch("analysis.views.render", side_effect=lambda req, tpl, ctx: ctx),
+        ):
+            # String "no" and "0" disable bulk_download even with ALLOW_DL_REPORTS_TO_ALL=True
+            for cfg in (api_cfg_str_no, api_cfg_str_zero):
+                with (
+                    patch("analysis.views.Config", return_value=cfg),
+                    patch("analysis.views.settings.ALLOW_DL_REPORTS_TO_ALL", True),
+                ):
+                    ctx = analysis_views.index(anon_req)
+                    assert ctx["config"]["bulk_download"] is False
+
+            # Enabled config + ALLOW_DL_REPORTS_TO_ALL=False hides for anon / unpermitted, shows for permitted
+            with (
+                patch("analysis.views.Config", return_value=api_cfg_enabled),
+                patch("analysis.views.settings.ALLOW_DL_REPORTS_TO_ALL", False),
+            ):
+                assert analysis_views.index(anon_req)["config"]["bulk_download"] is False
+                assert analysis_views.index(denied_req)["config"]["bulk_download"] is False
+                ctx_ok = analysis_views.index(permitted_req)
+                assert ctx_ok["config"]["bulk_download"] is True
+                assert ctx_ok["config"]["bulk_max_reports"] == 5
+
+            # Enabled config + ALLOW_DL_REPORTS_TO_ALL=True shows for everyone
+            with (
+                patch("analysis.views.Config", return_value=api_cfg_enabled),
+                patch("analysis.views.settings.ALLOW_DL_REPORTS_TO_ALL", True),
+            ):
+                ctx_all = analysis_views.index(anon_req)
+                assert ctx_all["config"]["bulk_download"] is True
+                assert ctx_all["config"]["bulk_max_reports"] == 5
+
+
+
+

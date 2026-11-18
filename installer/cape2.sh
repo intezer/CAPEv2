@@ -18,6 +18,7 @@ cat << EndOfHelp
         Base - Installs dependencies, CAPE, systemd, see code for full list
         All - Installs everything - (don't use it if you don't know what will be installed ;))
         Sandbox - Install CAPE
+        Update - Update CAPE
         Dependencies - Install all dependencies with performance tricks
         Systemd - Install systemd config for cape, we suggest to use systemd
         Nginx <domain.com> - Install NGINX with realip plugin and other goodies, pass your domain as argument
@@ -572,17 +573,17 @@ server {
     }
     # SSL configuration
     listen 443 ssl http2;
-    //listen [::]:443 ssl http2;
-    //listen 443 http3 reuseport;  # UDP listener for QUIC+HTTP/3
-    ssl        on;
-    //ssl_protocols       TLSv1.3; # QUIC requires TLS 1.3
+    #listen [::]:443 ssl http2;
+    listen 443 http3 reuseport;  # UDP listener for QUIC+HTTP/3
+    #ssl        on; # Obsolete in Nginx > 1.25.1
+    ssl_protocols       TLSv1.2 TLSv1.3; # QUIC requires TLS 1.3
     ssl_certificate         /etc/letsencrypt/live/$1/fullchain.pem;
     ssl_certificate_key     /etc/letsencrypt/live/$1/privkey.pem;
     ssl_client_certificate /etc/ssl/certs/cloudflare.crt;
     ssl_verify_client on;
 
-    //add_header Alt-Svc 'quic=":443"'; # Advertise that QUIC is available
-    //add_header QUIC-Status $quic;     # Sent when QUIC was used
+    add_header Alt-Svc 'h3=":443"; ma=86400'; # Advertise that QUIC is available
+    add_header QUIC-Status $quic;     # Sent when QUIC was used
 
     server_name $1 www.$1;
     location / {
@@ -1126,7 +1127,7 @@ function dependencies() {
     sudo apt-get install -y python3-pip build-essential libssl-dev libssl3 python3-dev cmake nfs-common crudini
     sudo apt-get install -y innoextract msitools iptables psmisc jq sqlite3 tmux net-tools checkinstall graphviz python3-pydot git numactl python3 python3-dev python3-pip libjpeg-dev zlib1g-dev
     sudo apt-get install -y zpaq upx-ucl wget zip unzip lzip rar unrar unace-nonfree cabextract geoip-database libgeoip-dev libjpeg-dev mono-utils ssdeep libfuzzy-dev exiftool
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y uthash-dev libconfig-dev libarchive-dev libtool autoconf automake privoxy software-properties-common wkhtmltopdf xvfb xfonts-100dpi tcpdump libcap2-bin wireshark-common
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y uthash-dev libconfig-dev libarchive-dev libtool autoconf automake privoxy software-properties-common wkhtmltopdf xvfb xfonts-100dpi tcpdump libcap2-bin wireshark-common tshark
     sudo apt-get install -y python3-pil subversion uwsgi uwsgi-plugin-python3 python3-pyelftools git curl
     sudo apt-get install -y openvpn wireguard
     # for bingraph
@@ -1145,19 +1146,20 @@ function dependencies() {
 
     sudo apt-get install -y locate && sudo updatedb # used by install_libvirt
 
-    # de4dot selfextraction
-    sudo apt-get install -y libgdiplus libdnlib2.1-cil libgif7 libmono-accessibility4.0-cil libmono-ldap4.0-cil libmono-posix4.0-cil libmono-sqlite4.0-cil libmono-system-componentmodel-dataannotations4.0-cil libmono-system-data4.0-cil libmono-system-design4.0-cil libmono-system-drawing4.0-cil libmono-system-enterpriseservices4.0-cil libmono-system-ldap4.0-cil libmono-system-runtime-serialization-formatters-soap4.0-cil libmono-system-runtime4.0-cil libmono-system-transactions4.0-cil libmono-system-web-applicationservices4.0-cil libmono-system-web-services4.0-cil libmono-system-web4.0-cil libmono-system-windows-forms4.0-cil libmono-webbrowser4.0-cil
-    de4dot_package_name="de4dot_3.1.41592.3405-2_all.deb"
-    # if not exist download package
-    if [ ! -f $de4dot_package_name ]; then
-        wget http://archive.ubuntu.com/ubuntu/pool/universe/d/de4dot/$de4dot_package_name
-    fi
-    if [ -f $de4dot_package_name ]; then
-        sudo dpkg -i $de4dot_package_name
-        sudo rm $de4dot_package_name
+    # de4dotEx selfextraction
+    de4dot_package_name="de4dotEx-3.12.0-x64.deb"
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then
+        if [ ! -f "$de4dot_package_name" ]; then
+            wget "https://github.com/GDATAAdvancedAnalytics/de4dotEx/releases/download/3.12.0/$de4dot_package_name"
+        fi
+        if [ -f "$de4dot_package_name" ]; then
+            sudo apt-get install -y "./$de4dot_package_name"
+            rm -f "$de4dot_package_name"
+        else
+            echo "[-] de4dotEx package not found"
+        fi
     else
-        echo "[-] de4dot package not found"
-        return
+        echo "[-] Skipping de4dotEx package: unsupported architecture $(dpkg --print-architecture)"
     fi
 
     # re2
@@ -1356,8 +1358,9 @@ function install_CAPE() {
     fi
 
     cd "$CAPE_ROOT/" || return
-    # copy *.conf.default and *.env to their destination so we have all properly updated fields
-    for filename in conf/default/*.conf.default conf/default/*.env; do
+    # copy *.conf.default and *.env.default to their destination so we have all properly updated fields
+    for filename in conf/default/*.conf.default conf/default/*.env.default; do
+        [ -e "$filename" ] || continue
         dest="conf/${filename#conf/default/}"
         cp -vf "./$filename" "./${dest%.default}"
     done
@@ -1419,6 +1422,12 @@ function install_systemd() {
     cp $CAPE_ROOT/systemd/cape-web.service /lib/systemd/system/cape-web.service
     cp $CAPE_ROOT/systemd/cape-rooter.service /lib/systemd/system/cape-rooter.service
     cp $CAPE_ROOT/systemd/suricata.service /lib/systemd/system/suricata.service
+
+    mkdir -p /etc/systemd/network
+    cp $CAPE_ROOT/systemd/00-ignore-vnet.network /etc/systemd/network/00-ignore-vnet.network
+    if systemctl is-active --quiet systemd-networkd; then
+        networkctl reload || true
+    fi
 
     if [ "$CAPE_ROOT" != "/opt/CAPEv2" ]; then
         sed -i "s|/opt/CAPEv2|$CAPE_ROOT|g" /lib/systemd/system/cape.service
@@ -1691,6 +1700,56 @@ function install_passivedns() {
     fi
 }
 
+function sync_installed_systemd_units() {
+    local systemd_dir="${SYSTEMD_UNIT_DIR:-/lib/systemd/system}"
+    local updated=0
+    for svc_src in "$CAPE_ROOT"/systemd/cape*.service; do
+        [ -f "$svc_src" ] || continue
+        local svc_name
+        svc_name=$(basename "$svc_src")
+        local svc_dest="$systemd_dir/$svc_name"
+        [ -f "$svc_dest" ] || continue
+
+        local svc_use_uv="$USE_UV"
+        local svc_uv_bin="/usr/local/bin/uv"
+        if [ "$svc_use_uv" = "true" ] || [ "$svc_use_uv" = "True" ]; then
+            svc_uv_bin="${PYTHON_MGR:-/usr/local/bin/uv}"
+        elif grep -Eq '^ExecStart=.*/uv([[:space:]]|$)' "$svc_dest" 2>/dev/null; then
+            svc_use_uv="true"
+        fi
+
+        sudo cp "$svc_src" "$svc_dest"
+        if [ "$CAPE_ROOT" != "/opt/CAPEv2" ]; then
+            sudo sed -i "s|/opt/CAPEv2|$CAPE_ROOT|g" "$svc_dest"
+        fi
+        if [ "$svc_use_uv" = "true" ] || [ "$svc_use_uv" = "True" ]; then
+            sudo sed -i "\|^ExecStartPre=.*/poetry .*|d" "$svc_dest" || true
+            sudo sed -i "s|/etc/poetry/bin/poetry|$svc_uv_bin|g" "$svc_dest"
+        fi
+        updated=1
+    done
+    if [ "$updated" -eq 1 ]; then
+        sudo systemctl daemon-reload
+    fi
+}
+
+function update() {
+    echo "[+] Updating CAPEv2"
+    sudo systemctl stop "cape*"
+    cd "$CAPE_ROOT" || return
+    sudo -u ${USER} git pull
+    sudo -u ${USER} bash -c "cd $CAPE_ROOT && export PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring; export CRYPTOGRAPHY_DONT_BUILD_RUST=1; $PYTHON_MGR $PYTHON_MGR_INSTALL_PYPROJECT"
+    if sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --check 2>&1 | grep -Fq "alembic upgrade head"; then
+        sudo -u ${USER} bash -c "cd $CAPE_ROOT/utils/db_migration && $PYTHON_MGR $PYTHON_MGR_CMD alembic upgrade head"
+    fi
+    if ! sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --check >/dev/null 2>&1; then
+        sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --noinput
+    fi
+    sudo -u ${USER} find "$CAPE_ROOT" -name '*.pyc' -delete
+    sync_installed_systemd_units
+    systemctl list-unit-files "cape*" --state=enabled --no-legend | awk '{print $1}' | xargs -r sudo systemctl start
+}
+
 # Doesn't work ${$1,,}
 COMMAND=$(echo "$1"|tr "{A-Z}" "{a-z}")
 
@@ -1845,6 +1904,8 @@ case "$COMMAND" in
     install_passivedns;;
 'libvirt')
     install_libvirt;;
+'update')
+    update;;
 *)
     usage;;
 esac

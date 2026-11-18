@@ -13,10 +13,12 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import collections
+import copy
 import hashlib
 import json
 import logging
 import os
+import re
 import timeit
 from contextlib import suppress
 from pathlib import Path
@@ -25,6 +27,11 @@ from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.cape_utils import cape_name_from_yara, is_duplicated_binary, pe_map, static_config_parsers
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.integrations.file_extra_info import DuplicatesType, static_file_info
+from lib.cuckoo.common.integrations.shellcode_utils import (
+    SHELLCODE_CODE_MAPPING,
+    extract_shellcode_payloads,
+    process_file_shellcode,
+)
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.replace_patterns_utils import _clean_path
@@ -32,6 +39,7 @@ from lib.cuckoo.common.utils import (
     add_family_detection,
     convert_to_printable_and_truncate,
     get_clamav_consensus,
+    get_files_storage_path,
     get_options,
     make_bytes,
     texttypes,
@@ -42,6 +50,7 @@ from dev_utils.mongodb import mongo_find_one
 processing_conf = Config("processing")
 integrations_conf = Config("integrations")
 externalservices_conf = Config("externalservices")
+reporting_conf = Config("reporting")
 
 HAVE_VIRUSTOTAL = False
 if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_demand:
@@ -70,6 +79,8 @@ code_mapping = {
     0x1000: "Unpacked PE Image",
     0x6A: "AMSI Buffer",
     0x6B: "AMSI Stream",
+    # recovered statically by static_shellcode_check from a shellcode payload
+    **SHELLCODE_CODE_MAPPING,
 }
 
 inject_map = {
@@ -81,6 +92,164 @@ unpack_map = {
     8: "Unpacked PE Image",
     9: "Unpacked Shellcode",
 }
+
+_DUMP_CREATED_RE = re.compile(
+    r"(?:(?:Payload|Unpacked image|Monitor dump) successfully created|Process dump output file):\s*(.+?)(?:\s*\(size\s+\d+\s+bytes\))?\s*$"
+)
+_DUMP_ON_API_CALL_RE = re.compile(r"Dump-on-API:\s*(\S+)\s+call detected")
+_DUMP_ON_API_DUMPED_RE = re.compile(
+    r"Dump-on-API:\s*Dumped memory region at\s*(0x[0-9a-fA-F]+)\s+due to\s+(\S+)\s+call\.?"
+)
+_BREAKPOINT_HIT_RE = re.compile(r"Breakpoint\s+(\d+)\s+at\s+(0x[0-9a-fA-F]+)")
+_ACTION_DISPATCHER_DUMP_RE = re.compile(
+    r"ActionDispatcher:\s*Dumped\s+(?:region|breaking module|image)\s+at\s+(0x[0-9a-fA-F]+)"
+)
+_PROCESS_OEP_DUMP_RE = re.compile(
+    r"ProcessOEP:\s*Dumped module with OEP at\s+(0x[0-9a-fA-F]+),\s*base\s+(0x[0-9a-fA-F]+)"
+)
+_YARA_HIT_RE = re.compile(r"YaraScan hit:\s*(\S+)")
+_YARA_DUMP_RE = re.compile(r"YaraScan:\s*Dump of region at\s+(0x[0-9a-fA-F]+)\s+triggered by Yara")
+
+
+def _normalize_hex_addr(addr: str) -> str:
+    if not addr or not isinstance(addr, str):
+        return ""
+    addr = addr.strip().lower()
+    if addr.startswith("0x"):
+        try:
+            return hex(int(addr, 16))
+        except ValueError:
+            return addr
+    return addr
+
+
+def _normalize_guest_path(path: str) -> str:
+    if not path or not isinstance(path, str):
+        return ""
+    return path.strip().replace("/", "\\").lower()
+
+
+def extract_dump_triggers(log_path: str = "", analysis_path: str = "", options_str: str = "") -> dict:
+    """Correlate CAPE payload dumps with the debugger breakpoint or dump-on-api option that generated them."""
+    by_guest_path = {}
+    by_address = {}
+    opts = get_options(options_str or "")
+
+    def _format_bp_trigger(bp_idx: str, bp_addr: str) -> str:
+        opt_key = f"bp{bp_idx}"
+        br_key = f"br{bp_idx}"
+        action_key = f"action{bp_idx}"
+        label = f"{opt_key}={opts[opt_key]}" if opt_key in opts else (f"{br_key}={opts[br_key]}" if br_key in opts else f"bp{bp_idx}")
+        if bp_addr:
+            label = f"{label} ({bp_addr})"
+        if action_key in opts:
+            label = f"{label} -> {action_key}={opts[action_key]}"
+        return label
+
+    log_files = []
+    if log_path and path_exists(log_path):
+        log_files.append(log_path)
+    if analysis_path:
+        debugger_dir = os.path.join(analysis_path, "debugger")
+        if path_exists(debugger_dir):
+            try:
+                for fname in sorted(os.listdir(debugger_dir)):
+                    if fname.endswith(".log"):
+                        log_files.append(os.path.join(debugger_dir, fname))
+            except OSError:
+                pass
+
+    for lpath in log_files:
+        pending_api = ""
+        last_bp = ""
+        last_yara = ""
+        last_created_keys = []
+        try:
+            with open(lpath, "r", encoding="utf-8", errors="ignore") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+
+                    m_api_call = _DUMP_ON_API_CALL_RE.search(line)
+                    if m_api_call:
+                        pending_api = m_api_call.group(1).rstrip(".")
+                        continue
+
+                    m_bp = _BREAKPOINT_HIT_RE.search(line)
+                    if m_bp:
+                        last_bp = _format_bp_trigger(m_bp.group(1), m_bp.group(2))
+                        continue
+
+                    m_yara = _YARA_HIT_RE.search(line)
+                    if m_yara:
+                        last_yara = m_yara.group(1).rstrip(".")
+                        continue
+
+                    m_created = _DUMP_CREATED_RE.search(line)
+                    if m_created:
+                        gpath = _normalize_guest_path(m_created.group(1))
+                        gbase = gpath.rsplit("\\", 1)[-1] if gpath else ""
+                        last_created_keys = [k for k in (gpath, gbase) if k]
+                        if pending_api:
+                            for k in last_created_keys:
+                                by_guest_path[k] = f"dump-on-api={pending_api}"
+                        elif last_bp:
+                            for k in last_created_keys:
+                                by_guest_path.setdefault(k, last_bp)
+                        continue
+
+                    m_api_dumped = _DUMP_ON_API_DUMPED_RE.search(line)
+                    if m_api_dumped:
+                        addr = _normalize_hex_addr(m_api_dumped.group(1))
+                        api_name = m_api_dumped.group(2).rstrip(".")
+                        trigger = f"dump-on-api={api_name}"
+                        if addr:
+                            by_address[addr] = trigger
+                        for k in last_created_keys:
+                            by_guest_path[k] = trigger
+                        pending_api = ""
+                        last_created_keys = []
+                        continue
+
+                    m_act = _ACTION_DISPATCHER_DUMP_RE.search(line)
+                    if m_act:
+                        addr = _normalize_hex_addr(m_act.group(1))
+                        trigger = last_bp or "ActionDispatcher"
+                        if addr:
+                            by_address[addr] = trigger
+                        for k in last_created_keys:
+                            by_guest_path[k] = trigger
+                        last_created_keys = []
+                        continue
+
+                    m_oep = _PROCESS_OEP_DUMP_RE.search(line)
+                    if m_oep:
+                        oep = m_oep.group(1)
+                        base = _normalize_hex_addr(m_oep.group(2))
+                        trigger = f"{last_bp} (OEP {oep})" if last_bp else f"OEP ({oep})"
+                        if base:
+                            by_address[base] = trigger
+                        for k in last_created_keys:
+                            by_guest_path[k] = trigger
+                        last_created_keys = []
+                        continue
+
+                    m_ydump = _YARA_DUMP_RE.search(line)
+                    if m_ydump:
+                        addr = _normalize_hex_addr(m_ydump.group(1))
+                        trigger = f"YARA: {last_yara}" if last_yara else "YARA"
+                        if addr:
+                            by_address[addr] = trigger
+                        for k in last_created_keys:
+                            by_guest_path[k] = trigger
+                        last_created_keys = []
+                        continue
+        except OSError:
+            continue
+
+    return {"by_guest_path": by_guest_path, "by_address": by_address}
+
 
 
 class CAPE(Processing):
@@ -161,11 +330,37 @@ class CAPE(Processing):
                 file_info["cape_type"] = unpack_map[file_info["cape_type_code"]]
                 if len(metastrings) > 4:
                     file_info["virtual_address"] = metastrings[3]
+                if len(metastrings) > 5 and metastrings[4]:
+                    file_info["dump_trigger"] = metastrings[4]
 
             type_strings = file_info["type"].split()
             append_file = self._cape_type_string(type_strings, file_info, append_file)
 
+        if not file_info.get("dump_trigger"):
+            trigger = self._resolve_dump_trigger(metadata, file_info)
+            if trigger:
+                file_info["dump_trigger"] = trigger
+
         return type_string, append_file
+
+    def _resolve_dump_trigger(self, metadata: dict, file_info: dict) -> str:
+        triggers = getattr(self, "_dump_triggers", None) or {}
+        by_guest_path = triggers.get("by_guest_path") or {}
+        by_address = triggers.get("by_address") or {}
+
+        guest_filepath = _normalize_guest_path(metadata.get("filepath", ""))
+        if guest_filepath:
+            if guest_filepath in by_guest_path:
+                return by_guest_path[guest_filepath]
+            guest_base = guest_filepath.rsplit("\\", 1)[-1]
+            if guest_base and guest_base in by_guest_path:
+                return by_guest_path[guest_base]
+
+        vaddr = _normalize_hex_addr(file_info.get("virtual_address", ""))
+        if vaddr and vaddr in by_address:
+            return by_address[vaddr]
+
+        return ""
 
     def process_file(self, file_path, append_file, metadata: dict, *, category: str, duplicated: DuplicatesType) -> dict:
         """Process file.
@@ -193,26 +388,36 @@ class CAPE(Processing):
         cached = False
         pefile_object = None
         run_static = True
+        preview_configs_by_name = {}
 
         # Calculate options hash to prevent poisoning
         opts = get_options(self.task.get("options", ""))
         sorted_opts = json.dumps(opts, sort_keys=True)
         options_hash = hashlib.sha256(sorted_opts.encode()).hexdigest()
 
-        if processing_conf.CAPE.file_cache:
+        if processing_conf.CAPE.file_cache or (reporting_conf.mongodb.enabled and category in ("static", "file")):
             try:
                 db_file = mongo_find_one("files", {"sha256": sha256})
-                if db_file:
+                if db_file and (
+                    processing_conf.CAPE.file_cache
+                    or self.task.get("id") in db_file.get("_task_ids", [])
+                    or bool(db_file.get("static_preview_enriched"))
+                ):
+                    for cfg in db_file.get("static_preview_malware_conf") or []:
+                        if isinstance(cfg, dict):
+                            for k, v in cfg.items():
+                                if k != "_associated_config_hashes" and isinstance(v, dict):
+                                    preview_configs_by_name[k] = v
                     # Security Fix: Update path immediately
                     db_file["path"] = file_path
-                    if "_id" in db_file:
-                        del db_file["_id"]
+                    for internal_key in ("_id", "_task_ids", "static_preview_malware_conf", "static_preview_enriched"):
+                        db_file.pop(internal_key, None)
 
                     yara_match = db_file.get("yara_hash", "") == File.yara_rules_hash
                     options_match = db_file.get("options_hash", "") == options_hash
                     file_info = db_file
                     cached = True
-                    if yara_match and options_match:
+                    if processing_conf.CAPE.file_cache and yara_match and options_match:
                         run_static = False
                         if HAVE_VIRUSTOTAL:
                             # We might want to refresh VT based on cache policy
@@ -289,6 +494,10 @@ class CAPE(Processing):
             )
 
         type_string, append_file = self._metadata_processing(metadata, file_info, append_file)
+        if metadata.get("extracted_from"):
+            file_info["extracted_from"] = metadata["extracted_from"]
+        else:
+            file_info.pop("extracted_from", None)
 
         if category in ("static", "file"):
             if MISP_HASH_LOOKUP:
@@ -359,7 +568,19 @@ class CAPE(Processing):
                 if file.get("data", b""):
                     extracted_file_data = make_bytes(file["data"])
                 else:
-                    extracted_file_data = Path(file["path"]).read_bytes()
+                    extracted_path = file.get("path", "")
+                    if not (extracted_path and path_exists(extracted_path)) and file.get("sha256"):
+                        candidate = os.path.join(self.self_extracted, file["sha256"]) if self.self_extracted else ""
+                        if candidate and path_exists(candidate):
+                            extracted_path = candidate
+                        else:
+                            with suppress(ValueError):
+                                storage_candidate = get_files_storage_path(file["sha256"])
+                                if path_exists(storage_candidate):
+                                    extracted_path = storage_candidate
+                    if not (extracted_path and path_exists(extracted_path)):
+                        continue
+                    extracted_file_data = Path(extracted_path).read_bytes()
                 for yara in file["cape_yara"]:
                     all_files.append(
                         (
@@ -392,7 +613,10 @@ class CAPE(Processing):
                 append_file = self._cape_type_string(type_strings, file_info, append_file)
 
             if cape_name and cape_name not in executed_config_parsers[tmp_path]:
-                tmp_config = static_config_parsers(cape_name, tmp_path, tmp_data)
+                if tmp_path == file_info["path"] and cape_name in preview_configs_by_name:
+                    tmp_config = {cape_name: copy.deepcopy(preview_configs_by_name[cape_name])}
+                else:
+                    tmp_config = static_config_parsers(cape_name, tmp_path, tmp_data)
                 self.update_cape_configs(cape_name, tmp_config, file_info)
                 executed_config_parsers[tmp_path].add(cape_name)
 
@@ -407,6 +631,17 @@ class CAPE(Processing):
                     cape_names.add(cape_name)
                     log.debug("CAPE: config returned for: %s", cape_name)
                     self.update_cape_configs(cape_name, tmp_config, file_info)
+
+        shellcode_payloads = process_file_shellcode(
+            file_info,
+            file_data,
+            category=category,
+            task=self.task,
+            opts=opts,
+            results=self.results,
+            detect2pid=self.detect2pid,
+            add_statistic=self.add_statistic_tmp,
+        )
 
         self.link_configs_to_analysis()
         self.add_family_detections(file_info, cape_names)
@@ -426,6 +661,20 @@ class CAPE(Processing):
                 self.add_statistic_tmp("flare_capa", "time", pretime=pretime)
             self.cape["payloads"].append(file_info)
 
+        if shellcode_payloads:
+            deferred = getattr(self, "_deferred_shellcode_payloads", None)
+            if deferred is not None:
+                deferred.append((file_info, shellcode_payloads))
+            else:
+                extract_shellcode_payloads(
+                    file_info,
+                    shellcode_payloads,
+                    self_extracted_dir=self.self_extracted,
+                    process_file_cb=lambda path, append, meta: self.process_file(
+                        path, append, meta, category="CAPE", duplicated=duplicated
+                    ),
+                )
+
     def _set_dict_keys(self):
         self.cape = {"payloads": [], "configs": []}
 
@@ -434,6 +683,12 @@ class CAPE(Processing):
         @return: list of CAPE output files with related information.
         """
         self._set_dict_keys()
+        self._deferred_shellcode_payloads = []
+        self._dump_triggers = extract_dump_triggers(
+            getattr(self, "log_path", ""),
+            getattr(self, "analysis_path", ""),
+            self.task.get("options", "") if hasattr(self, "task") and isinstance(self.task, dict) else "",
+        )
         meta = {}
         # Required to control files extracted by integrations.conf as we store them in dropped
         duplicated: DuplicatesType = collections.defaultdict(set)
@@ -544,6 +799,16 @@ class CAPE(Processing):
                             # We set append_file to False as we don't wan't to include
                             # the files by default in the CAPE tab
                             self.process_file(filepath, False, meta.get(filepath, {}), category=category, duplicated=duplicated)
+        deferred, self._deferred_shellcode_payloads = self._deferred_shellcode_payloads, None
+        for parent_info, payloads in deferred:
+            extract_shellcode_payloads(
+                parent_info,
+                payloads,
+                self_extracted_dir=self.self_extracted,
+                process_file_cb=lambda path, append, meta: self.process_file(
+                    path, append, meta, category="CAPE", duplicated=duplicated
+                ),
+            )
         return self.cape
 
     def update_cape_configs(self, cape_name, config, file_obj):

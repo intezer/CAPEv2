@@ -86,3 +86,242 @@ def test_get_icon_info_logs_debug_not_error(caplog, monkeypatch, exc):
     assert res == (None, None, None, None)
     assert not any(r.levelname == "ERROR" for r in caplog.records)
 
+
+def test_extract_pkcs7_der_bytes_and_get_digital_signers():
+    import binascii
+    import datetime
+    import struct
+    import warnings
+    from unittest.mock import MagicMock
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs7
+    from cryptography.utils import CryptographyDeprecationWarning
+    from cryptography.x509.oid import NameOID
+    import pefile
+
+    import lib.cuckoo.common.integrations.parse_pe as parse_pe
+
+    # Generate synthetic self-signed X.509 certificate
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "Test Signer"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(123456789)
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .sign(private_key, hashes.SHA256())
+    )
+
+    pkcs7_der = pkcs7.serialize_certificates([cert], serialization.Encoding.DER)
+    assert len(pkcs7_der) > 0
+    assert pkcs7_der[0] == 0x30
+
+    header_offset = 128
+    prefix_data = b"\x90" * header_offset
+
+    raw_cert_len = len(pkcs7_der)
+    total_entry_len = 8 + raw_cert_len
+    pad_len = (8 - (total_entry_len % 8)) % 8
+    if pad_len == 0:
+        pad_len = 8
+    total_entry_len += pad_len
+    padding_bytes = b"\x00" * pad_len
+    overlay_bytes = b"OVERLAY_PAYLOAD_EXTRA_BYTES_1234567890"
+
+    win_cert_header = struct.pack("<IHH", total_entry_len, 0x0200, 0x0002)
+    win_cert_blob = win_cert_header + pkcs7_der + padding_bytes
+    pe_data = prefix_data + win_cert_blob + overlay_bytes
+
+    # 1. Test _extract_pkcs7_der_bytes directly
+    extracted = parse_pe._extract_pkcs7_der_bytes(pe_data, address=header_offset, size=total_entry_len)
+    assert extracted == pkcs7_der
+
+    extracted_with_overlay_in_size = parse_pe._extract_pkcs7_der_bytes(
+        pe_data, address=header_offset, size=total_entry_len + len(overlay_bytes)
+    )
+    assert extracted_with_overlay_in_size == pkcs7_der
+
+    # 2. Test get_digital_signers with mock PE
+    pe_helper = parse_pe.PortableExecutable("/tmp/fake_signed.exe")
+    fake_pe = MagicMock()
+    dir_index = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+    fake_dir_entry = MagicMock(VirtualAddress=header_offset, Size=total_entry_len)
+
+    fake_pe.OPTIONAL_HEADER.DATA_DIRECTORY = [MagicMock()] * (dir_index + 1)
+    fake_pe.OPTIONAL_HEADER.DATA_DIRECTORY[dir_index] = fake_dir_entry
+    fake_pe.write.return_value = pe_data
+
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+        signers = pe_helper.get_digital_signers(fake_pe)
+
+    discouraged_warnings = [
+        w for w in recorded_warnings
+        if issubclass(w.category, (UserWarning, CryptographyDeprecationWarning))
+    ]
+    assert discouraged_warnings == []
+
+    assert len(signers) == 1
+    signer = signers[0]
+    expected_md5 = binascii.hexlify(cert.fingerprint(hashes.MD5())).decode()
+    expected_sha1 = binascii.hexlify(cert.fingerprint(hashes.SHA1())).decode()
+    expected_sha256 = binascii.hexlify(cert.fingerprint(hashes.SHA256())).decode()
+
+    assert signer["md5_fingerprint"] == expected_md5
+    assert signer["sha1_fingerprint"] == expected_sha1
+    assert signer["sha256_fingerprint"] == expected_sha256
+    assert signer["serial_number"] == str(cert.serial_number)
+    assert signer["not_before"] == cert.not_valid_before_utc.isoformat()
+    assert signer["not_after"] == cert.not_valid_after_utc.isoformat()
+    assert signer["subject_commonName"] == "Test Signer"
+    assert signer["issuer_commonName"] == "Test Signer"
+
+
+def test_get_digital_signers_crl_distribution_points_without_full_name():
+    import base64
+    import datetime
+    import ipaddress
+    import json
+    import struct
+    from unittest.mock import MagicMock
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs7
+    from cryptography.x509.oid import AuthorityInformationAccessOID, NameOID, ObjectIdentifier
+    import pefile
+
+    import lib.cuckoo.common.integrations.parse_pe as parse_pe
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "CRL Test Signer"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    crl_dp = x509.CRLDistributionPoints([
+        # 1. DistributionPoint with relative_name and full_name=None
+        x509.DistributionPoint(
+            full_name=None,
+            relative_name=x509.RelativeDistinguishedName([x509.NameAttribute(NameOID.COMMON_NAME, "CRL1")]),
+            reasons=None,
+            crl_issuer=None,
+        ),
+        # 2. DistributionPoint with crl_issuer only (both full_name=None and relative_name=None)
+        x509.DistributionPoint(
+            full_name=None,
+            relative_name=None,
+            reasons=None,
+            crl_issuer=[x509.DirectoryName(issuer)],
+        ),
+        # 3. DistributionPoint with full_name containing multiple entries (DirectoryName + URI)
+        x509.DistributionPoint(
+            full_name=[
+                x509.DirectoryName(issuer),
+                x509.UniformResourceIdentifier("http://crl.example.com/root.crl"),
+            ],
+            relative_name=None,
+            reasons=None,
+            crl_issuer=None,
+        ),
+        # 4. DistributionPoint with a single full_name entry
+        x509.DistributionPoint(
+            full_name=[
+                x509.UniformResourceIdentifier("http://crl2.example.com/sub.crl"),
+            ],
+            relative_name=None,
+            reasons=None,
+            crl_issuer=None,
+        ),
+    ])
+    aia = x509.AuthorityInformationAccess([
+        x509.AccessDescription(
+            AuthorityInformationAccessOID.CA_ISSUERS,
+            x509.DirectoryName(issuer),
+        ),
+        x509.AccessDescription(
+            AuthorityInformationAccessOID.OCSP,
+            x509.IPAddress(ipaddress.IPv4Address("192.0.2.10")),
+        ),
+    ])
+    san = x509.SubjectAlternativeName([
+        x509.IPAddress(ipaddress.IPv4Address("192.0.2.1")),
+        x509.RegisteredID(ObjectIdentifier("1.2.840.113549.1.1.1")),
+        x509.OtherName(ObjectIdentifier("1.3.6.1.4.1.311.20.2.3"), b"\x0c\x04test"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(987654321)
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(crl_dp, critical=False)
+        .add_extension(aia, critical=False)
+        .add_extension(san, critical=False)
+        .sign(private_key, hashes.SHA256())
+    )
+
+    pkcs7_der = pkcs7.serialize_certificates([cert], serialization.Encoding.DER)
+    header_offset = 64
+    total_entry_len = 8 + len(pkcs7_der)
+    win_cert_header = struct.pack("<IHH", total_entry_len, 0x0200, 0x0002)
+    pe_data = (b"\x90" * header_offset) + win_cert_header + pkcs7_der
+
+    pe_helper = parse_pe.PortableExecutable("/tmp/fake_crl_signed.exe")
+    fake_pe = MagicMock()
+    dir_index = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+    fake_dir_entry = MagicMock(VirtualAddress=header_offset, Size=total_entry_len)
+    fake_pe.OPTIONAL_HEADER.DATA_DIRECTORY = [MagicMock()] * (dir_index + 1)
+    fake_pe.OPTIONAL_HEADER.DATA_DIRECTORY[dir_index] = fake_dir_entry
+    fake_pe.write.return_value = pe_data
+
+    signers = pe_helper.get_digital_signers(fake_pe)
+    assert len(signers) == 1
+    signer = signers[0]
+    assert signer["extensions_cRLDistributionPoints_0"] == "CN=CRL1"
+    assert "extensions_cRLDistributionPoints_1" not in signer
+    assert signer["extensions_cRLDistributionPoints_2_0"] == "CN=CRL Test Signer"
+    assert signer["extensions_cRLDistributionPoints_2_1"] == "http://crl.example.com/root.crl"
+    assert signer["extensions_cRLDistributionPoints_3"] == "http://crl2.example.com/sub.crl"
+    assert signer["extensions_authorityInfoAccess_caIssuers"] == "CN=CRL Test Signer"
+    assert signer["extensions_authorityInfoAccess_OCSP"] == "192.0.2.10"
+    assert signer["extensions_subjectAltName_0"] == "192.0.2.1"
+    assert signer["extensions_subjectAltName_1"] == "1.2.840.113549.1.1.1"
+    assert signer["extensions_subjectAltName_2"] == base64.b64encode(b"\x0c\x04test").decode()
+    assert json.loads(json.dumps(signer)) == signer
+
+
+def test_get_filetype_memfd_fallback_on_zip_buffer(monkeypatch):
+    import io
+    import zipfile
+
+    import lib.cuckoo.common.integrations.parse_pe as parse_pe
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("hello.txt", b"hello world\n")
+    zip_bytes = buf.getvalue()
+
+    pe_helper = parse_pe.PortableExecutable("/tmp/fake_resource.exe")
+    monkeypatch.setattr(parse_pe, "HAVE_MAGIC", True)
+    monkeypatch.delattr(parse_pe.magic, "open", raising=False)
+    monkeypatch.setattr(parse_pe.magic, "from_buffer", lambda _data: "data")
+
+    filetype = pe_helper._get_filetype(zip_bytes)
+    assert filetype is not None
+    assert "Zip archive data" in filetype
+
+
+
+

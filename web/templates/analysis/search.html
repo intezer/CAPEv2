@@ -5,9 +5,11 @@
         <div class="card bg-dark shadow-sm border-secondary">
             <div class="card-body">
                 <form role="form" action="{% url "search" %}" method="get">
-                    <div class="input-group w-50 mx-auto">
-                        <input type="text" class="form-control bg-dark text-white border-secondary" id="form_search" name="search" placeholder="Search term (exact match by default)..." aria-label="Search">
-                        <button class="btn btn-outline-info" type="submit"><i class="fas fa-search"></i> Search</button>
+                    <div class="col-12 col-md-8 col-lg-6 mx-auto">
+                        <div class="input-group">
+                            <input type="text" class="form-control bg-dark text-white border-secondary" id="form_search" name="search" placeholder="Search term (exact match by default)..." aria-label="Search">
+                            <button class="btn btn-outline-info" type="submit"><i class="fas fa-search"></i> Search</button>
+                        </div>
                     </div>
                 </form>
                 <div class="text-center mt-3">
@@ -16,7 +18,7 @@
             </div>
         </div>
 
-        <div id="help" class="collapse mt-3 w-75 mx-auto">
+        <div id="help" class="collapse mt-3 col-12 col-lg-9 mx-auto">
             <div class="card bg-dark border-secondary">
                 <div class="card-header border-secondary">
                     <h5 class="mb-0 text-white"><i class="fas fa-info-circle me-2"></i> Search Help</h5>
@@ -119,11 +121,16 @@
 <div class="row mb-3">
     <div class="col-12 text-white-50 text-center">
         <h3>Results for term: <span class="text-danger font-weight-bold">{{term}}</span></h3>
-        {% if term_only in 'md5,sha1,sha256' %}
+        {% if term_only == 'md5' or term_only == 'sha1' or term_only == 'sha256' %}
             <p class="text-muted mt-1">Note: Hash searches match all generated files inside analysis. Use <code>target_sha256:</code> for initial file matches.</p>
         {% endif %}
-        {% if settings.ZIPPED_DOWNLOAD_ALL and term_only in 'capetype,capeyara' %}
-            <a href="{% url 'file' term_only|add:'zipall' '1' value_only %}" class="btn btn-sm btn-outline-warning mt-2" data-bs-toggle="tooltip" title="Download password-protected archive with all matching files."><i class="fas fa-file-archive me-1"></i> Download All Matches</a>
+        {% if settings.ZIPPED_DOWNLOAD_ALL and value_only %}
+            {% if term_only == 'capetype' or term_only == 'capeyara' %}
+                {% url 'file' term_only|add:'zipall' '1' value_only as zipall_url %}
+                {% if zipall_url %}
+                    <a href="{{ zipall_url }}" class="btn btn-sm btn-outline-warning mt-2" data-bs-toggle="tooltip" title="Download password-protected archive with all matching files."><i class="fas fa-file-archive me-1"></i> Download All Matches</a>
+                {% endif %}
+            {% endif %}
         {% endif %}
     </div>
 </div>
