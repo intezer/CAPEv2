@@ -49,7 +49,7 @@ class ProcessTests(unittest.TestCase):
     def test_execute_fallback_when_parent_spoofing_fails(self, _mock_access, _mock_create_folders, _mock_err_str):
         from lib.common.defines import CREATE_NEW_CONSOLE, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT
 
-        p = Process(options={"executiondir": "C:\\Users\\Bruno\\Desktop"})
+        p = Process(options={"executiondir": "C:\\Users\\Bruno\\Desktop", "explorer_parent": "1"})
         with (
             patch.object(p, "build_parent_attribute_list", return_value=(None, MagicMock(), None)),
             patch("lib.api.process.KERNEL32") as mock_k32,
@@ -67,7 +67,7 @@ class ProcessTests(unittest.TestCase):
     @patch("lib.api.process.create_custom_folders")
     @patch("lib.api.process.os.access", return_value=True)
     def test_execute_returns_false_when_both_attempts_fail(self, _mock_access, _mock_create_folders, _mock_err_str):
-        p = Process(options={"executiondir": "C:\\Users\\Bruno\\Desktop"})
+        p = Process(options={"executiondir": "C:\\Users\\Bruno\\Desktop", "explorer_parent": "1"})
         with (
             patch.object(p, "build_parent_attribute_list", return_value=(None, MagicMock(), None)),
             patch("lib.api.process.KERNEL32") as mock_k32,
@@ -76,3 +76,24 @@ class ProcessTests(unittest.TestCase):
             mock_k32.GetLastError.return_value = 5
             self.assertFalse(p.execute("C:\\Users\\Bruno\\Desktop\\installer.exe"))
             self.assertEqual(mock_k32.CreateProcessW.call_count, 2)
+
+    @patch("lib.api.process.create_custom_folders")
+    @patch("lib.api.process.os.access", return_value=True)
+    def test_execute_default_does_not_use_explorer_parent(self, _mock_access, _mock_create_folders):
+        """By default the sample must keep the analyzer's (elevated) token, so no parent attribute is used."""
+        from lib.common.defines import CREATE_NEW_CONSOLE, CREATE_SUSPENDED
+
+        p = Process(options={"executiondir": "C:\\Users\\Bruno\\Desktop"})
+        with (
+            patch.object(p, "build_parent_attribute_list") as mock_build,
+            patch("lib.api.process.KERNEL32") as mock_k32,
+        ):
+            mock_k32.CreateProcessW.return_value = True
+            self.assertTrue(p.execute("C:\\Users\\Bruno\\Desktop\\installer.exe"))
+            mock_build.assert_not_called()
+            self.assertEqual(mock_k32.CreateProcessW.call_count, 1)
+            self.assertEqual(mock_k32.CreateProcessW.call_args[0][5], CREATE_NEW_CONSOLE | CREATE_SUSPENDED)
+
+    def test_build_parent_attribute_list_annotation_not_evaluated(self):
+        """ctypes.Array[...] raises TypeError at import time on Python 3.8 (Windows 7 guests) unless quoted."""
+        self.assertIsInstance(Process.build_parent_attribute_list.__annotations__["return"], str)

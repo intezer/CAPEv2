@@ -50,7 +50,7 @@ from lib.common.constants import (
     TTD32_NAME,
     TTD64_NAME,
 )
-from lib.common.constants import OPT_CURDIR, OPT_EXECUTIONDIR
+from lib.common.constants import OPT_CURDIR, OPT_EXECUTIONDIR, OPT_EXPLORER_PARENT
 from lib.common.defines import (
     ADVAPI32,
     CREATE_NEW_CONSOLE,
@@ -559,7 +559,9 @@ class Process:
 
         return True
 
-    def build_parent_attribute_list(self) -> Tuple[LPVOID, Array[c_char], HANDLE]:
+    # Quoted: ctypes.Array is not subscriptable at runtime before Python 3.9 (Windows 7 guests run 3.8),
+    # and an unquoted annotation is evaluated at import time, which kills the whole analyzer.
+    def build_parent_attribute_list(self) -> "Tuple[LPVOID, Array[c_char], HANDLE]":
         cb_attribute_list_size = SIZE_T(0)
         ok = KERNEL32.InitializeProcThreadAttributeList(None, 1, 0, byref(cb_attribute_list_size))
         last_error = KERNEL32.GetLastError()
@@ -636,14 +638,6 @@ class Process:
             log.error('Unable to access file at path "%s", execution aborted', path)
             return False
 
-        startup_info = STARTUPINFOEXW()
-        startup_info.StartupInfo.cb = sizeof(STARTUPINFOEXW)
-        attr_list, attr_buf, h_parent = self.build_parent_attribute_list()
-        startup_info.lpAttributeList = attr_list
-        # STARTF_USESHOWWINDOW
-        startup_info.StartupInfo.dwFlags = 1
-        # SW_SHOWNORMAL
-        startup_info.StartupInfo.wShowWindow = 1
         process_info = PROCESS_INFORMATION()
 
         arguments = f'"{path}" '
@@ -651,7 +645,6 @@ class Process:
             arguments += args
 
         self.path = path
-        creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
 
         # Use the custom execution directory if provided, otherwise launch in the same location
         # where the sample resides (default %TEMP%)
@@ -662,20 +655,37 @@ class Process:
         # Try to create the custom directories so that the execution path is deemed valid
         create_custom_folders(execution_directory)
 
-        created = KERNEL32.CreateProcessW(
-            path, arguments, None, None, False, creation_flags, None, execution_directory, byref(startup_info), byref(process_info)
-        )
-        last_error = KERNEL32.GetLastError()
+        created = False
+        # Opt-in only: PROC_THREAD_ATTRIBUTE_PARENT_PROCESS makes the child inherit explorer's token, so the
+        # sample runs non-elevated while the analyzer runs as admin. Samples that need admin (writing to
+        # C:\Windows, installing services) then fail early and nothing gets unpacked.
+        if str(self.options.get(OPT_EXPLORER_PARENT, "0")).lower() in ("1", "true", "yes", "on"):
+            startup_info = STARTUPINFOEXW()
+            startup_info.StartupInfo.cb = sizeof(STARTUPINFOEXW)
+            attr_list, attr_buf, h_parent = self.build_parent_attribute_list()
+            startup_info.lpAttributeList = attr_list
+            # STARTF_USESHOWWINDOW
+            startup_info.StartupInfo.dwFlags = 1
+            # SW_SHOWNORMAL
+            startup_info.StartupInfo.wShowWindow = 1
+            creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
 
-        KERNEL32.CloseHandle(h_parent)
-        KERNEL32.DeleteProcThreadAttributeList(attr_list)
+            created = KERNEL32.CreateProcessW(
+                path, arguments, None, None, False, creation_flags, None, execution_directory, byref(startup_info), byref(process_info)
+            )
+            last_error = KERNEL32.GetLastError()
+
+            KERNEL32.CloseHandle(h_parent)
+            KERNEL32.DeleteProcThreadAttributeList(attr_list)
+
+            if not created:
+                log.warning(
+                    'Failed to execute process from path "%s" with explorer parent (Error: %s), retrying without parent attribute',
+                    path,
+                    get_error_string(last_error),
+                )
 
         if not created:
-            log.warning(
-                'Failed to execute process from path "%s" with explorer parent (Error: %s), retrying without parent attribute',
-                path,
-                get_error_string(last_error),
-            )
             fallback_startup_info = STARTUPINFO()
             fallback_startup_info.cb = sizeof(fallback_startup_info)
             fallback_startup_info.dwFlags = 1
