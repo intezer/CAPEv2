@@ -50,7 +50,7 @@ from lib.common.constants import (
     TTD32_NAME,
     TTD64_NAME,
 )
-from lib.common.constants import OPT_CURDIR, OPT_EXECUTIONDIR
+from lib.common.constants import OPT_CURDIR, OPT_EXECUTIONDIR, OPT_EXPLORER_PARENT
 from lib.common.defines import (
     ADVAPI32,
     CREATE_NEW_CONSOLE,
@@ -63,6 +63,7 @@ from lib.common.defines import (
     KERNEL32,
     LUID,
     MAX_PATH,
+    MAXIMUM_ALLOWED,
     NTDLL,
     OPEN_EXISTING,
     PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
@@ -76,9 +77,15 @@ from lib.common.defines import (
     SIZE_T,
     STARTUPINFO,
     STARTUPINFOEXW,
+    SECURITY_IMPERSONATION,
     STILL_ACTIVE,
     SYSTEM_INFO,
+    TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE,
+    TOKEN_ELEVATION_CLASS,
     TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
+    TOKEN_TYPE_PRIMARY,
     TH32CS_SNAPPROCESS,
     THREAD_ALL_ACCESS,
     UNICODE_STRING,
@@ -142,6 +149,24 @@ ADVAPI32.OpenProcessToken.argtypes = [HANDLE, DWORD, POINTER(HANDLE)]
 ADVAPI32.OpenProcessToken.restype = BOOL
 ADVAPI32.LookupPrivilegeValueW.argtypes = [LPCWSTR, LPCWSTR, POINTER(LUID)]
 ADVAPI32.LookupPrivilegeValueW.restype = BOOL
+ADVAPI32.DuplicateTokenEx.argtypes = [HANDLE, DWORD, LPVOID, c_int, c_int, POINTER(HANDLE)]
+ADVAPI32.DuplicateTokenEx.restype = BOOL
+ADVAPI32.CreateProcessAsUserW.argtypes = [
+    HANDLE,
+    LPCWSTR,
+    LPWSTR,
+    LPVOID,
+    LPVOID,
+    BOOL,
+    DWORD,
+    LPVOID,
+    LPCWSTR,
+    LPVOID,
+    POINTER(PROCESS_INFORMATION),
+]
+ADVAPI32.CreateProcessAsUserW.restype = BOOL
+ADVAPI32.GetTokenInformation.argtypes = [HANDLE, c_int, LPVOID, DWORD, POINTER(DWORD)]
+ADVAPI32.GetTokenInformation.restype = BOOL
 
 NTDLL.NtQueryInformationProcess.restype = c_int
 NTDLL.NtQueryInformationProcess.argtypes = [c_void_p, c_int, c_void_p, c_ulong, POINTER(c_ulong)]
@@ -559,7 +584,40 @@ class Process:
 
         return True
 
-    def build_parent_attribute_list(self) -> Tuple[LPVOID, Array[c_char], HANDLE]:
+    @staticmethod
+    def duplicate_own_primary_token():
+        """Return a primary token duplicated from this (analyzer) process, or None on failure.
+        A sibling of the caller's token can be assigned by CreateProcessAsUserW without SeAssignPrimaryTokenPrivilege.
+        """
+        h_token = HANDLE()
+        if not ADVAPI32.OpenProcessToken(
+            KERNEL32.GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, byref(h_token)
+        ):
+            log.warning("OpenProcessToken failed: %s", get_error_string(KERNEL32.GetLastError()))
+            return None
+        h_dup = HANDLE()
+        ok = ADVAPI32.DuplicateTokenEx(h_token, MAXIMUM_ALLOWED, None, SECURITY_IMPERSONATION, TOKEN_TYPE_PRIMARY, byref(h_dup))
+        last_error = KERNEL32.GetLastError()
+        KERNEL32.CloseHandle(h_token)
+        if not ok:
+            log.warning("DuplicateTokenEx failed: %s", get_error_string(last_error))
+            return None
+        return h_dup
+
+    def is_elevated(self):
+        """Return True/False for the process token's elevation, or None if it can't be queried."""
+        h_token = HANDLE()
+        if not self.h_process or not ADVAPI32.OpenProcessToken(self.h_process, TOKEN_QUERY, byref(h_token)):
+            return None
+        elevation = DWORD()
+        returned = DWORD()
+        ok = ADVAPI32.GetTokenInformation(h_token, TOKEN_ELEVATION_CLASS, byref(elevation), sizeof(elevation), byref(returned))
+        KERNEL32.CloseHandle(h_token)
+        return bool(elevation.value) if ok else None
+
+    # Quoted: ctypes.Array is not subscriptable at runtime before Python 3.9 (Windows 7 guests run 3.8),
+    # and an unquoted annotation is evaluated at import time, which kills the whole analyzer.
+    def build_parent_attribute_list(self) -> "Tuple[LPVOID, Array[c_char], HANDLE]":
         cb_attribute_list_size = SIZE_T(0)
         ok = KERNEL32.InitializeProcThreadAttributeList(None, 1, 0, byref(cb_attribute_list_size))
         last_error = KERNEL32.GetLastError()
@@ -578,6 +636,7 @@ class Process:
         hwnd = windll.user32.GetShellWindow()
         explorer_pid = DWORD()
         windll.user32.GetWindowThreadProcessId(hwnd, byref(explorer_pid))
+        log.debug("Explorer parent pid: %d", explorer_pid.value)
 
         raw_parent = KERNEL32.OpenProcess(PROCESS_CREATE_PROCESS, False, explorer_pid)
         if not raw_parent:
@@ -636,14 +695,6 @@ class Process:
             log.error('Unable to access file at path "%s", execution aborted', path)
             return False
 
-        startup_info = STARTUPINFOEXW()
-        startup_info.StartupInfo.cb = sizeof(STARTUPINFOEXW)
-        attr_list, attr_buf, h_parent = self.build_parent_attribute_list()
-        startup_info.lpAttributeList = attr_list
-        # STARTF_USESHOWWINDOW
-        startup_info.StartupInfo.dwFlags = 1
-        # SW_SHOWNORMAL
-        startup_info.StartupInfo.wShowWindow = 1
         process_info = PROCESS_INFORMATION()
 
         arguments = f'"{path}" '
@@ -651,7 +702,6 @@ class Process:
             arguments += args
 
         self.path = path
-        creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
 
         # Use the custom execution directory if provided, otherwise launch in the same location
         # where the sample resides (default %TEMP%)
@@ -662,20 +712,54 @@ class Process:
         # Try to create the custom directories so that the execution path is deemed valid
         create_custom_folders(execution_directory)
 
-        created = KERNEL32.CreateProcessW(
-            path, arguments, None, None, False, creation_flags, None, execution_directory, byref(startup_info), byref(process_info)
-        )
-        last_error = KERNEL32.GetLastError()
+        created = False
+        # Launch with explorer.exe as parent (disable with explorer_parent=0). With PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+        # the child inherits the parent's token unless one is passed explicitly, and explorer's token is not elevated
+        # while the analyzer's is. So pass a duplicate of our own token via CreateProcessAsUserW. Never fall back to
+        # CreateProcessW with the parent attribute: the sample would run non-elevated and admin-requiring samples
+        # (writing to C:\Windows, installing services) fail early, losing their behavior and payloads.
+        if str(self.options.get(OPT_EXPLORER_PARENT, "1")).lower() not in ("0", "false", "no", "off"):
+            h_token = self.duplicate_own_primary_token()
+            if h_token:
+                startup_info = STARTUPINFOEXW()
+                startup_info.StartupInfo.cb = sizeof(STARTUPINFOEXW)
+                attr_list, attr_buf, h_parent = self.build_parent_attribute_list()
+                startup_info.lpAttributeList = attr_list
+                # STARTF_USESHOWWINDOW
+                startup_info.StartupInfo.dwFlags = 1
+                # SW_SHOWNORMAL
+                startup_info.StartupInfo.wShowWindow = 1
+                creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
 
-        KERNEL32.CloseHandle(h_parent)
-        KERNEL32.DeleteProcThreadAttributeList(attr_list)
+                created = ADVAPI32.CreateProcessAsUserW(
+                    h_token,
+                    path,
+                    arguments,
+                    None,
+                    None,
+                    False,
+                    creation_flags,
+                    None,
+                    execution_directory,
+                    byref(startup_info),
+                    byref(process_info),
+                )
+                last_error = KERNEL32.GetLastError()
+
+                KERNEL32.CloseHandle(h_parent)
+                KERNEL32.DeleteProcThreadAttributeList(attr_list)
+                KERNEL32.CloseHandle(h_token)
+
+                if not created:
+                    log.warning(
+                        'Failed to execute process from path "%s" with explorer parent (Error: %s), retrying without parent attribute',
+                        path,
+                        get_error_string(last_error),
+                    )
+            else:
+                log.warning("Could not duplicate the analyzer token, launching without explorer parent")
 
         if not created:
-            log.warning(
-                'Failed to execute process from path "%s" with explorer parent (Error: %s), retrying without parent attribute',
-                path,
-                get_error_string(last_error),
-            )
             fallback_startup_info = STARTUPINFO()
             fallback_startup_info.cb = sizeof(fallback_startup_info)
             fallback_startup_info.dwFlags = 1
@@ -700,6 +784,7 @@ class Process:
             self.thread_id = process_info.dwThreadId
             self.h_thread = process_info.hThread
             log.info('Successfully executed process from path "%s" with arguments "%s" with pid %d', path, args or "", self.pid)
+            log.debug("Process %d token elevated: %s", self.pid, self.is_elevated())
             # self.log_process_tree(os.path.basename(path))
             if kernel_analysis:
                 return self.kernel_analyze()
